@@ -23,20 +23,7 @@ class Work:
         return bool(key) and any(title_key(name) == key for name in self.names)
 
 
-# Community abbreviations missing from the corresponding VNDB entries.
-TITLE_ABBREVIATIONS = {
-    "星白": Work(
-        "v28297",
-        "星空列车与白的旅行",
-        (
-            "星空列车与白的旅行",
-            "星空鉄道とシロの旅",
-            "The Starry Sky Train and Shiro's Journey",
-            "星空列車與白的旅行",
-            "Hoshizora Tetsudou to Shiro no Tabi",
-        ),
-    ),
-}
+SHORT_HAN_TITLE = re.compile(r"[\u3400-\u9fff]{2}")
 
 
 class Titles:
@@ -52,13 +39,16 @@ class Titles:
         Returns:
             Works with Chinese, Japanese and English titles where available.
         """
+        key = title_key(query)
+        short = SHORT_HAN_TITLE.fullmatch(key) is not None
         response = await self.client.post(
             "https://api.vndb.org/kana/vn",
             json={
                 "filters": ["search", "=", query],
                 "fields": "title,alttitle,titles{lang,title},aliases",
-                "sort": "searchrank",
-                "results": 6,
+                "sort": "votecount" if short else "searchrank",
+                "reverse": short,
+                "results": 12 if short else 6,
             },
         )
         response.raise_for_status()
@@ -96,9 +86,13 @@ def search_terms(query: str, work: Work | None) -> tuple[str, ...]:
 
 def resembles(query: str, work: Work) -> bool:
     key = title_key(query)
+    if SHORT_HAN_TITLE.fullmatch(key):
+        return any(
+            re.search(f"{key[0]}.*{key[1]}", title_key(name)) for name in work.names
+        )
     return len(key) >= 3 and any(
         SequenceMatcher(None, key, title_key(name)).ratio() >= 0.5
-        or (len(key) >= 4 and key in title_key(name))
+        or key in title_key(name)
         for name in work.names
     )
 

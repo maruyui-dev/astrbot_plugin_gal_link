@@ -1,4 +1,5 @@
 import importlib
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,35 +12,95 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
-    async def test_xingbai_resolves_in_group_without_a_model_or_vndb_alias(self):
+    async def test_short_queries_offer_dynamic_candidates_before_searching_resources(
+        self,
+    ):
+        def entry(id_, title, *other_titles):
+            return {
+                "id": id_,
+                "title": title,
+                "alttitle": None,
+                "aliases": [],
+                "titles": [
+                    {"lang": lang, "title": name}
+                    for lang, name in zip(
+                        ("zh-Hans", "ja", "en"), (title, *other_titles)
+                    )
+                ],
+            }
+
+        train = entry(
+            "v28297",
+            "星空列车与白的旅行",
+            "星空鉄道とシロの旅",
+            "The Starry Sky Train and Shiro's Journey",
+        )
+        queries = []
+
         async def catalog(request):
-            return httpx.Response(200, json={"results": []})
+            query = json.loads(request.content)["filters"][2]
+            queries.append(query)
+            results = {
+                "星 白": [train, entry("v12984", "星辰恋曲的白色永恒")],
+                "天使": [
+                    entry("v61094", "天使"),
+                    entry("v40520", "天使☆嚣嚣 RE-BOOT!"),
+                    entry("v860", "银河天使"),
+                ],
+            }
+            return httpx.Response(200, json={"results": results.get(query, [])})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(catalog)) as client:
             star = plugin.GalLink(SimpleNamespace())
             self.addAsyncCleanup(star.terminate)
             star.titles = plugin.Titles(client)
             star.sites.search = AsyncMock(return_value=([], 1))
-            event = SimpleNamespace(
-                unified_msg_origin="test:GroupMessage:1",
-                get_sender_id=lambda: "42",
-                get_self_id=lambda: "123",
-                get_platform_name=lambda: "aiocqhttp",
-                get_messages=lambda: [At(qq="123"), Plain(" 给我一个星白的安装包")],
-                get_extra=lambda key: None,
-                plain_result=lambda message: SimpleNamespace(use_t2i=lambda _: message),
+
+            async def send(text, sender="42"):
+                event = SimpleNamespace(
+                    unified_msg_origin="test:GroupMessage:1",
+                    get_sender_id=lambda: sender,
+                    get_self_id=lambda: "123",
+                    get_platform_name=lambda: "aiocqhttp",
+                    get_messages=lambda: [At(qq="123"), Plain(text)],
+                    get_extra=lambda key: None,
+                    plain_result=lambda message: SimpleNamespace(
+                        use_t2i=lambda _: message
+                    ),
+                )
+                if not plugin.MentionedGalRequest().filter(event, {}):
+                    return []
+                return [result async for result in star.on_group_message(event)]
+
+            for text in (
+                "星白",
+                "找一下星白",
+                "能帮我找一下星白吗",
+                "给我一个星白的安装包",
+            ):
+                with self.subTest(text=text):
+                    replies = await send(text)
+                    self.assertEqual(len(replies), 1)
+                    self.assertIn(
+                        "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[0]
+                    )
+                    self.assertIn("@BOT 2", replies[0])
+            self.assertIn("星 白", queries)
+            self.assertEqual(await send("1", sender="43"), [])
+            star.sites.search.assert_not_awaited()
+            await send("1")
+            self.assertEqual(
+                star.sites.search.await_args.args[0],
+                (
+                    "星空列车与白的旅行",
+                    "星空鉄道とシロの旅",
+                    "The Starry Sky Train and Shiro's Journey",
+                ),
             )
-
-            replies = [result async for result in star.on_group_message(event)]
-
-        terms = star.sites.search.await_args.args[0]
-        self.assertIn("星空列车与白的旅行", terms)
-        self.assertIn("星空鉄道とシロの旅", terms)
-        self.assertIn("The Starry Sky Train and Shiro's Journey", terms)
-        self.assertEqual(
-            replies,
-            ["暂未找到《星空列车与白的旅行》的可用资源。\n部分站点暂时无法查询。"],
-        )
+            star.sites.search.reset_mock()
+            replies = await send("天使")
+            self.assertIn("2. 天使☆嚣嚣 RE-BOOT!\n3. 银河天使", replies[0])
+            star.sites.search.assert_not_awaited()
 
     async def test_group_message_gate_and_reply_state(self):
         handler = next(
