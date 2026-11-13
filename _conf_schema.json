@@ -1,0 +1,9 @@
+{
+  "touchgal_api_token": {
+    "description": "TouchGal 官方 API Token",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "填入 TouchGal 开发者门户签发的 API Token 后启用该站。留空时跳过 TouchGal。"
+  }
+}
