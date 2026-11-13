@@ -13,11 +13,19 @@ from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star
 
 from .sources import Resource, Sites
-from .titles import Titles, Work, resembles, search_terms, title_key
+from .titles import (
+    TITLE_ABBREVIATIONS,
+    Titles,
+    Work,
+    looks_like_typo,
+    resembles,
+    search_terms,
+    title_key,
+)
 
 REQUEST = re.compile(
     r"(?:请|麻烦)?(?:帮我|给我|发我|我想|我要|想|求|有没有|能不能)?\s*"
-    r"(?:找一下|找找|找|查找|搜一下|搜索|搜|查一下|查|玩|下载|一份|一个|下个游戏|下个)?\s*"
+    r"(?:(?:查找|搜索|找找|找|搜|查|玩|下载)(?:\s*一下)?|一份|一个|下个游戏|下个)?\s*"
     r"(?P<title>[^，。！？?!；;\r\n]{2,100}?)"
     r"(?:\s*(?:的)?(?:游戏资源|安装包|游戏本体|下载链接|资源链接|下载地址|下载|资源))?"
     r"(?:\s*(?:吗|嘛|吧|谢谢|可以吗))?[。！？?!]?"
@@ -186,6 +194,9 @@ class GalLink(Star):
     async def lookup(
         self, session: str, query: str, selected: Work | None, *, implicit: bool = False
     ) -> tuple[str, ReplyState | None]:
+        selected = selected or TITLE_ABBREVIATIONS.get(title_key(query))
+        if selected:
+            query = selected.title
         try:
             works = (
                 [selected]
@@ -198,7 +209,26 @@ class GalLink(Star):
 
         exact = [item for item in works if item.matches(query)]
         work = selected or (exact[0] if len(exact) == 1 else None)
-        terms = search_terms(query, work)
+        candidates = {
+            item.id: item
+            for item in exact or works
+            if item in exact or resembles(query, item)
+        }
+        if work is None and not exact:
+            close = [
+                item for item in candidates.values() if looks_like_typo(query, item)
+            ]
+            if not close:
+                for item in await self.corrections(session, query):
+                    candidates.setdefault(item.id, item)
+                close = [
+                    item for item in candidates.values() if looks_like_typo(query, item)
+                ]
+            if len(close) == 1:
+                work = close[0]
+
+        search_title = work.title if work and not work.matches(query) else query
+        terms = search_terms(search_title, work)
         resources, failed = (
             await self.sites.search(terms) if len(exact) < 2 else ([], 0)
         )
@@ -209,14 +239,6 @@ class GalLink(Star):
             return self.render(state), state if len(resources) > PAGE_SIZE else None
 
         if not work:
-            candidates = {
-                item.id: item
-                for item in exact or works
-                if resembles(query, item) or item in exact
-            }
-            if len(candidates) < 2:
-                for item in await self.corrections(session, query):
-                    candidates.setdefault(item.id, item)
             if candidates and (
                 not implicit
                 or any(resembles(query, item) for item in candidates.values())

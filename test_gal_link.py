@@ -11,6 +11,36 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_xingbai_resolves_in_group_without_a_model_or_vndb_alias(self):
+        async def catalog(request):
+            return httpx.Response(200, json={"results": []})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(catalog)) as client:
+            star = plugin.GalLink(SimpleNamespace())
+            self.addAsyncCleanup(star.terminate)
+            star.titles = plugin.Titles(client)
+            star.sites.search = AsyncMock(return_value=([], 1))
+            event = SimpleNamespace(
+                unified_msg_origin="test:GroupMessage:1",
+                get_sender_id=lambda: "42",
+                get_self_id=lambda: "123",
+                get_platform_name=lambda: "aiocqhttp",
+                get_messages=lambda: [At(qq="123"), Plain(" 给我一个星白的安装包")],
+                get_extra=lambda key: None,
+                plain_result=lambda message: SimpleNamespace(use_t2i=lambda _: message),
+            )
+
+            replies = [result async for result in star.on_group_message(event)]
+
+        terms = star.sites.search.await_args.args[0]
+        self.assertIn("星空列车与白的旅行", terms)
+        self.assertIn("星空鉄道とシロの旅", terms)
+        self.assertIn("The Starry Sky Train and Shiro's Journey", terms)
+        self.assertEqual(
+            replies,
+            ["暂未找到《星空列车与白的旅行》的可用资源。\n部分站点暂时无法查询。"],
+        )
+
     async def test_group_message_gate_and_reply_state(self):
         handler = next(
             (obj for obj in vars(plugin).values() if hasattr(obj, "on_group_message")),
@@ -69,6 +99,54 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已到最后一页", second[0])
         self.assertEqual(await reply(event("下一页")), [])
         star.sites.search.assert_awaited_once()
+
+    async def test_group_search_uses_the_full_title_without_confirmation(self):
+        work = plugin.Work(
+            "v19073",
+            "千恋＊万花",
+            ("千恋＊万花", "Senren Banka"),
+        )
+        context = SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="test"),
+            llm_generate=AsyncMock(
+                return_value=SimpleNamespace(completion_text='["千恋万花"]')
+            ),
+        )
+        star = plugin.GalLink(context)
+        self.addAsyncCleanup(star.terminate)
+        star.titles.find = AsyncMock(
+            side_effect=lambda title: [work] if work.matches(title) else []
+        )
+
+        async def search(terms):
+            if "Senren Banka" in terms:
+                return [
+                    plugin.Resource("测试站", work.title, "https://example.org/file")
+                ], 0
+            return [], 0
+
+        star.sites.search = AsyncMock(side_effect=search)
+        for text in ("查找一下千恋万花", "我想玩千元万花", "给我一个千元万华的安装包"):
+            with self.subTest(text=text):
+                star.sites.search.reset_mock()
+                context.llm_generate.reset_mock()
+                event = SimpleNamespace(
+                    unified_msg_origin="test:GroupMessage:1",
+                    get_sender_id=lambda: "42",
+                    get_self_id=lambda: "123",
+                    get_platform_name=lambda: "aiocqhttp",
+                    get_messages=lambda: [At(qq="123"), Plain(text)],
+                    get_extra=lambda key: None,
+                    plain_result=lambda message: SimpleNamespace(
+                        use_t2i=lambda _: message
+                    ),
+                )
+                replies = [result async for result in star.on_group_message(event)]
+                self.assertEqual(len(replies), 1)
+                self.assertTrue(replies[0].startswith("找到《千恋＊万花》"), replies[0])
+                star.sites.search.assert_awaited_once()
+                if text.startswith("查找一下"):
+                    context.llm_generate.assert_not_awaited()
 
     async def test_correction_candidates_are_validated_and_selection_searches_three_languages(
         self,

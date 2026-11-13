@@ -23,6 +23,22 @@ class Work:
         return bool(key) and any(title_key(name) == key for name in self.names)
 
 
+# Community abbreviations missing from the corresponding VNDB entries.
+TITLE_ABBREVIATIONS = {
+    "星白": Work(
+        "v28297",
+        "星空列车与白的旅行",
+        (
+            "星空列车与白的旅行",
+            "星空鉄道とシロの旅",
+            "The Starry Sky Train and Shiro's Journey",
+            "星空列車與白的旅行",
+            "Hoshizora Tetsudou to Shiro no Tabi",
+        ),
+    ),
+}
+
+
 class Titles:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
@@ -85,3 +101,32 @@ def resembles(query: str, work: Work) -> bool:
         or (len(key) >= 4 and key in title_key(name))
         for name in work.names
     )
+
+
+def looks_like_typo(query: str, work: Work) -> bool:
+    """Check whether the input is close enough to a verified title to auto-search.
+
+    Args:
+        query: The title extracted from the user's message.
+        work: A work returned by the catalog.
+
+    Returns:
+        Whether a title variant differs only by a likely typo.
+    """
+    key = title_key(query)
+    if len(key) < 3:
+        return False
+    for name in work.names:
+        candidate = title_key(name)
+        if SequenceMatcher(None, key, candidate).ratio() >= 0.8:
+            return True
+        # Short Chinese titles can have several mistyped characters while retaining their shape.
+        if len(key) == len(candidate) == 4 and re.fullmatch(
+            r"[\u3400-\u9fff]{8}", key + candidate
+        ):
+            if (
+                key[0] == candidate[0]
+                and sum(a == b for a, b in zip(key, candidate, strict=True)) >= 2
+            ):
+                return True
+    return False
