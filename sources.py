@@ -20,12 +20,24 @@ CATCAT = "https://catcat.cloud"
 MMPAN = "https://pan.mmpan.top"
 
 TYPE_LABEL = re.compile(
-    r"(?<![A-Za-z])(?:PC(?:安装直装|免安装|直装|安装版)?|Windows|Android|APK|iOS|"
-    r"Ty(?:rano(?:Builder)?)?|KRKR|KR|ONS|JoiPlay|Switch|NS|PSP|"
+    r"(?<![A-Za-z])(?:PC(?:安装直装|免安装|直装|安装版)?|Windows|Android|APK|iOS|IPA|"
+    r"Ty(?:rano(?:r|Builder)?)?|KRKR|KR|Kirikiri(?:2)?|Kirikiroid2|吉里吉里(?:2)?|"
+    r"ONS(?:cripter)?|JoiPlay|Switch|NS|PSP|"
     r"安卓(?:直装)?|安装直装|免安装(?:版)?|直装(?:版)?|安装版|硬盘版|便携版)(?![A-Za-z])",
     re.IGNORECASE,
 )
-ARCHIVE = re.compile(r"\.(?:7z|rar|zip|apk|iso|tar|gz|xz|exe)(?:\.\d+)?$", re.I)
+ARCHIVE = re.compile(r"\.(?:7z|rar|zip|apk|ipa|iso|tar|gz|xz|exe)(?:\.\d+)?$", re.I)
+PLATFORM_PATTERNS = tuple(
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"(?<![A-Za-z])APK(?![A-Za-z])|安卓直装",
+        r"(?<![A-Za-z])(?:PC|Windows)(?![A-Za-z])",
+        r"(?<![A-Za-z])(?:iOS|IPA)(?![A-Za-z])",
+        r"(?<![A-Za-z])Ty(?:rano(?:r|Builder)?)?(?![A-Za-z])",
+        r"(?<![A-Za-z])(?:KRKR|KR|Kirikiri2?|Kirikiroid2)(?![A-Za-z])|吉里吉里2?",
+        r"(?<![A-Za-z])ONS(?:cripter)?(?![A-Za-z])",
+    )
+)
 SHARE_URL = re.compile(r'https://[^\s<>"「」『』【】。；，！？]+')
 SHARE_HOSTS = {
     "pan.baidu.com": "百度网盘",
@@ -109,13 +121,18 @@ class Sites:
         return results
 
     async def search(
-        self, terms: tuple[str, ...], *, fallback_terms: tuple[str, ...] = ()
+        self,
+        terms: tuple[str, ...],
+        *,
+        fallback_terms: tuple[str, ...] = (),
+        platforms: frozenset[int] = frozenset(),
     ) -> tuple[list[Resource], int]:
         """Search enabled sites concurrently with independent deadlines.
 
         Args:
             terms: Preferred Chinese titles and nicknames of one work.
             fallback_terms: Titles queried only when a site has no preferred matches.
+            platforms: Requested platform numbers; empty means unrestricted.
 
         Returns:
             Public resources and the number of sites that could not be searched.
@@ -161,6 +178,15 @@ class Sites:
                 ) as exc:
                     error = exc
                     continue
+                if platforms:
+                    matches = [
+                        item
+                        for item in matches
+                        if any(
+                            PLATFORM_PATTERNS[index - 1].search(item.type_label)
+                            for index in platforms
+                        )
+                    ]
                 if matches:
                     return matches
             if error:

@@ -38,6 +38,21 @@ INTENT = re.compile(
     r"|(?:安装包|游戏本体|下载链接|资源链接|游戏资源|下载地址)[。！？?!]?$"
 )
 NUMBER = re.compile(r"[1-9１-９]")
+PLATFORM_NUMBERS = re.compile(r"[0-9０-９]+(?:[\s,，、]+[0-9０-９]+)*")
+PLATFORM_NAMES = ("APK", "Windows", "iOS", "Ty", "KRKR", "ONS")
+PLATFORM_PROMPT = (
+    "请选择需要的平台或运行方式（支持多选）：\n"
+    "1. APK（安卓直装）\n"
+    "2. Windows（电脑端）\n"
+    "3. iOS（苹果手机 / iPad）\n"
+    "4. Ty（Tyranor 模拟器）\n"
+    "5. KRKR（吉里吉里模拟器）\n"
+    "6. ONS（ONS 模拟器）\n"
+    "7. 不限平台\n"
+    "请由发起查询的群友直接回复序号，多选用空格或逗号分隔。\n"
+    "例如：1 2，表示同时查找 APK 和 Windows 资源。\n"
+    "选择「7」表示不限平台，本次选择在 10 分钟内有效。"
+)
 QUOTED_TITLE = re.compile(r"《(?P<title>[^《》\r\n]{2,100})》[。！？?!]?")
 BARE_TITLE = re.compile(r"[\u3400-\u9fff]{2,16}")
 PLAY_REQUEST = re.compile(r"^(?:请|麻烦)?(?:我想|我要|想)\s*玩")
@@ -66,6 +81,9 @@ class ReplyState:
     resources: tuple[Resource, ...] = ()
     page: int = 0
     awaiting_number: bool = False
+    awaiting_platform: bool = False
+    platforms: frozenset[int] = frozenset()
+    selected: Work | None = None
 
 
 # The synchronous message filter needs the same session state as the handler.
@@ -87,17 +105,21 @@ class MentionedGalRequest(filter.CustomFilter):
             return False
         chain = event.get_messages()
         text = "".join(part.text for part in chain if isinstance(part, Plain)).strip()
+        state = REPLY_STATES.get((event.unified_msg_origin, event.get_sender_id()))
+        platform_reply = bool(
+            state and state.awaiting_platform and state.expires_at > monotonic()
+        )
         if not any(
             isinstance(part, At) and str(part.qq) == str(event.get_self_id())
             for part in chain
         ):
-            if not NUMBER.fullmatch(text) or any(
-                isinstance(part, At) for part in chain
-            ):
+            if any(isinstance(part, At) for part in chain):
                 return False
-            state = REPLY_STATES.get((event.unified_msg_origin, event.get_sender_id()))
+            if platform_reply:
+                return bool(PLATFORM_NUMBERS.fullmatch(text))
             return bool(
-                state
+                NUMBER.fullmatch(text)
+                and state
                 and state.candidates
                 and state.awaiting_number
                 and state.expires_at > monotonic()
@@ -106,6 +128,7 @@ class MentionedGalRequest(filter.CustomFilter):
             return False
         return bool(
             (not text and all(isinstance(part, (At, Plain)) for part in chain))
+            or (platform_reply and PLATFORM_NUMBERS.fullmatch(text))
             or NUMBER.fullmatch(text)
             or text == "下一页"
             or QUOTED_TITLE.fullmatch(text)
@@ -230,7 +253,10 @@ class GalLink(Star):
         key = (event.unified_msg_origin, event.get_sender_id())
         state = self.replies.get(key)
         if not text:
-            if state and state.candidates:
+            if state and state.awaiting_platform:
+                state.expires_at = now + REPLY_TTL
+                yield event.plain_result(PLATFORM_PROMPT).use_t2i(False)
+            elif state and state.candidates:
                 state.awaiting_number = True
                 state.expires_at = now + REPLY_TTL
                 yield event.plain_result(
@@ -250,7 +276,31 @@ class GalLink(Star):
             return
 
         work = None
-        if NUMBER.fullmatch(text):
+        platforms = frozenset()
+        known_works = ()
+        ask_platform = False
+        if state and state.awaiting_platform and PLATFORM_NUMBERS.fullmatch(text):
+            tokens = re.split(
+                r"[\s,，、]+",
+                text.translate(str.maketrans("０１２３４５６７８９", "0123456789")),
+            )
+            if any(
+                token not in {"1", "2", "3", "4", "5", "6", "7"} for token in tokens
+            ):
+                yield event.plain_result(
+                    "请发送有效的平台序号（1～7），支持多选，例如「1 2」；选择「7」表示不限平台。"
+                ).use_t2i(False)
+                return
+            platforms = (
+                frozenset(int(token) for token in tokens)
+                if "7" not in tokens
+                else frozenset()
+            )
+            work = state.selected
+            known_works = state.candidates
+            query = state.title
+            state.awaiting_platform = False
+        elif NUMBER.fullmatch(text):
             index = int(text) - 1
             if state is None or not state.candidates:
                 return
@@ -262,6 +312,7 @@ class GalLink(Star):
             state.awaiting_number = False
             work = state.candidates[index]
             query = work.title
+            platforms = state.platforms
         else:
             match = QUOTED_TITLE.fullmatch(text) or REQUEST.fullmatch(text)
             if match is None:
@@ -269,20 +320,26 @@ class GalLink(Star):
             query = match.group("title").strip(' \t《》「」『』“”"')
             if NOT_A_TITLE.fullmatch(query) or not title_key(query):
                 return
+            ask_platform = True
 
         request = object()
         self.active[key] = request
         if state:
             state.awaiting_number = False
+            state.awaiting_platform = False
         try:
             response, state = await self.lookup(
                 event.unified_msg_origin,
                 query,
                 work,
-                implicit=work is None
+                implicit=ask_platform
+                and work is None
                 and not QUOTED_TITLE.fullmatch(text)
                 and not RESOURCE_INTENT.search(text)
                 and (not INTENT.search(text) or PLAY_REQUEST.match(text) is not None),
+                ask_platform=ask_platform,
+                platforms=platforms,
+                known_works=known_works,
             )
             # A newer search owns the reply state for this user and group.
             if self.active.get(key) is request and response:
@@ -303,15 +360,40 @@ class GalLink(Star):
                 self.active.pop(key, None)
 
     async def lookup(
-        self, session: str, query: str, selected: Work | None, *, implicit: bool = False
+        self,
+        session: str,
+        query: str,
+        selected: Work | None,
+        *,
+        implicit: bool = False,
+        ask_platform: bool = False,
+        platforms: frozenset[int] = frozenset(),
+        known_works: tuple[Work, ...] = (),
     ) -> tuple[str, ReplyState | None]:
+        """Resolve a title, request platforms and search matching resource types.
+
+        Args:
+            session: The requesting group's unified message origin.
+            query: The title extracted from the request or chosen work.
+            selected: A work already confirmed by the user or catalog.
+            implicit: Whether the message lacks an explicit resource request.
+            ask_platform: Whether to return the platform prompt before searching.
+            platforms: Selected platform numbers; empty means unrestricted.
+            known_works: Catalog candidates resolved before the platform prompt.
+
+        Returns:
+            The response text and any remaining interaction state.
+        """
+        if ask_platform and not implicit:
+            return PLATFORM_PROMPT, ReplyState(0, title=query, awaiting_platform=True)
         key = title_key(query)
         short = SHORT_HAN_TITLE.fullmatch(key) is not None
         try:
             works = (
                 [selected]
                 if selected
-                else await asyncio.wait_for(self.titles.find(query), 4)
+                else list(known_works)
+                or await asyncio.wait_for(self.titles.find(query), 4)
             )
             if (
                 short
@@ -343,6 +425,15 @@ class GalLink(Star):
             if not short and len(close) == 1:
                 work = close[0]
 
+        if ask_platform and (work is not None or candidates):
+            return PLATFORM_PROMPT, ReplyState(
+                0,
+                title=query,
+                candidates=tuple(candidates.values()),
+                awaiting_platform=True,
+                selected=work,
+            )
+
         if (
             not work
             and candidates
@@ -362,7 +453,9 @@ class GalLink(Star):
                     "请由发起查询的群友在 10 分钟内操作。",
                 ]
             )
-            return "\n".join(lines), ReplyState(0, candidates=options)
+            return "\n".join(lines), ReplyState(
+                0, candidates=options, platforms=platforms
+            )
 
         if work is None and short:
             if implicit:
@@ -380,13 +473,20 @@ class GalLink(Star):
                 term for term in terms if title_key(term) not in chinese_keys
             )
             resources, failed = await self.sites.search(
-                preferred, fallback_terms=fallback
+                preferred, fallback_terms=fallback, platforms=platforms
             )
         else:
-            resources, failed = await self.sites.search(terms)
+            resources, failed = await self.sites.search(terms, platforms=platforms)
+        if ask_platform:
+            if not resources:
+                return "", None
+            return PLATFORM_PROMPT, ReplyState(0, title=query, awaiting_platform=True)
         if resources:
             state = ReplyState(
-                0, title=work.title if work else query, resources=tuple(resources)
+                0,
+                title=work.title if work else query,
+                resources=tuple(resources),
+                platforms=platforms,
             )
             return self.render(state), state if len(resources) > PAGE_SIZE else None
 
@@ -397,9 +497,24 @@ class GalLink(Star):
         if failed == total_sites:
             return "资源站点暂时无法查询，请稍后再试。", None
         reply = f"暂未找到《{title}》的可用资源。"
+        state = None
+        if platforms:
+            types = " / ".join(PLATFORM_NAMES[index - 1] for index in sorted(platforms))
+            reply = (
+                f"暂未找到《{title}》的 {types} 资源。\n"
+                "可直接回复「7」查看不限平台的结果，或回复其他平台序号（支持多选）。\n"
+                "请由发起查询的群友在 10 分钟内操作。"
+            )
+            state = ReplyState(
+                0,
+                title=title,
+                selected=work,
+                awaiting_platform=True,
+                platforms=platforms,
+            )
         if failed:
             reply += "\n部分站点暂时无法查询。"
-        return reply, None
+        return reply, state
 
     async def corrections(self, session: str, query: str) -> list[Work]:
         try:
@@ -452,6 +567,13 @@ class GalLink(Star):
             f"找到《{state.title}》",
             f"共 {total} 条资源 · 第 {state.page + 1} / {pages} 页",
         ]
+        if state.platforms:
+            lines.append(
+                "筛选  "
+                + " / ".join(
+                    PLATFORM_NAMES[index - 1] for index in sorted(state.platforms)
+                )
+            )
         for index, item in enumerate(state.resources[start:last], start + 1):
             lines.extend(["", f"{index}. {item.source}", f"名称  {item.title}"])
             if item.type_label:

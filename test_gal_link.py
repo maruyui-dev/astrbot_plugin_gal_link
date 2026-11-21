@@ -19,6 +19,204 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    def stub_resources(self, star, resources):
+        star.sites.shinnku = AsyncMock(return_value=resources)
+        star.sites.library = AsyncMock(return_value=[])
+        star.sites.openlist = AsyncMock(return_value=[])
+        star.sites.search = AsyncMock(wraps=star.sites.search)
+
+    async def send(
+        self,
+        star,
+        text,
+        *,
+        sender="42",
+        group="test:GroupMessage:1",
+        target="123",
+        handlers=None,
+    ):
+        components = [Plain(text)]
+        if target is not None:
+            components.insert(0, At(qq=target))
+        event = SimpleNamespace(
+            unified_msg_origin=group,
+            get_sender_id=lambda: sender,
+            get_self_id=lambda: "123",
+            get_platform_name=lambda: "aiocqhttp",
+            get_messages=lambda: components,
+            get_extra=lambda key: handlers if key == "handlers_parsed_params" else None,
+            plain_result=lambda message: SimpleNamespace(use_t2i=lambda _: message),
+        )
+        return [result async for result in star.on_group_message(event)]
+
+    async def test_platform_multiselect_filters_before_pagination_and_scopes_replies(
+        self,
+    ):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        work = plugin.Work("v1", "千恋万花", ("千恋万花",))
+        star.titles.find = AsyncMock(return_value=[work])
+        kinds = ["APK", "PC", "iOS", "Ty", "APK", "Windows", "", "KRKR", "ONS"]
+        self.stub_resources(
+            star,
+            [
+                plugin.Resource("测试站", f"资源{i}", f"https://example.org/{i}", kind)
+                for i, kind in enumerate(kinds)
+            ],
+        )
+        prompt = await self.send(star, "查找千恋万花")
+        self.assertIn("支持多选", prompt[0])
+        self.assertIn("3. iOS", prompt[0])
+        self.assertIn("7. 不限平台", prompt[0])
+        star.sites.search.assert_not_awaited()
+        self.assertEqual(await self.send(star, "1 2", sender="43", target=None), [])
+        self.assertEqual(
+            await self.send(star, "1 2", group="test:GroupMessage:2", target=None), []
+        )
+        self.assertEqual(await self.send(star, "1 2", target="999"), [])
+        self.assertEqual(
+            await self.send(star, "1 2", target=None, handlers={"other": {}}), []
+        )
+        invalid = await self.send(star, "1 8", target=None)
+        self.assertIn("1～7", invalid[0])
+        star.sites.search.assert_not_awaited()
+        first = await self.send(star, "１，２、１", target=None)
+        self.assertIn("共 4 条资源 · 第 1 / 2 页", first[0])
+        self.assertIn("APK / Windows", first[0])
+        self.assertEqual(await self.send(star, "下一页", sender="43"), [])
+        last = await self.send(star, "下一页")
+        self.assertIn("已到最后一页", last[0])
+        combined = "\n".join(first + last)
+        for index in (0, 1, 4, 5):
+            self.assertIn(f"https://example.org/{index}", combined)
+        for index in (2, 3, 6, 7, 8):
+            self.assertNotIn(f"https://example.org/{index}", combined)
+        self.assertEqual(await self.send(star, "1 2", target=None), [])
+        star.sites.search.assert_awaited_once()
+
+    async def test_platform_choice_survives_work_disambiguation(self):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        works = (
+            plugin.Work("v1", "星空列车与白的旅行", ("星空列车与白的旅行",)),
+            plugin.Work("v2", "星辰恋曲的白色永恒", ("星辰恋曲的白色永恒",)),
+        )
+        star.titles.find = AsyncMock(return_value=list(works))
+        self.stub_resources(
+            star,
+            [
+                plugin.Resource("测试站", "直装.apk", "https://example.org/apk", "APK"),
+                plugin.Resource("测试站", "电脑版.zip", "https://example.org/pc", "PC"),
+            ],
+        )
+        prompt = await self.send(star, "查找星白")
+        self.assertIn("支持多选", prompt[0])
+        candidates = await self.send(star, "1", target=None)
+        self.assertIn("1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", candidates[0])
+        star.sites.search.assert_not_awaited()
+        self.assertEqual(await self.send(star, "1", target=None), [])
+        await self.send(star, "")
+        result = await self.send(star, "1", target=None)
+        self.assertIn("https://example.org/apk", result[0])
+        self.assertNotIn("https://example.org/pc", result[0])
+        star.sites.search.assert_awaited_once()
+
+    async def test_other_platform_chinese_hits_do_not_block_foreign_fallback(self):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        work = plugin.Work(
+            "v1", "千恋万花", ("千恋万花", "Senren Banka"), ("千恋万花",)
+        )
+        star.titles.find = AsyncMock(return_value=[work])
+        phases = []
+
+        async def shinnku(terms, keys):
+            phases.append(terms)
+            if terms == ("千恋万花",):
+                return [plugin.Resource("测试站", "PC", "https://example.org/pc", "PC")]
+            return [plugin.Resource("测试站", "APK", "https://example.org/apk", "APK")]
+
+        star.sites.shinnku = shinnku
+        star.sites.library = AsyncMock(return_value=[])
+        star.sites.openlist = AsyncMock(return_value=[])
+        await self.send(star, "查找千恋万花")
+        result = await self.send(star, "1", target=None)
+        self.assertEqual(len(result), 1)
+        self.assertIn("https://example.org/apk", result[0])
+        self.assertNotIn("https://example.org/pc", result[0])
+        self.assertEqual(phases, [("千恋万花",), ("Senren Banka",)])
+
+    async def test_missing_platform_keeps_selection_open_and_all_platforms_can_retry(
+        self,
+    ):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        work = plugin.Work("v1", "千恋万花", ("千恋万花",))
+        star.titles.find = AsyncMock(return_value=[work])
+        self.stub_resources(
+            star,
+            [
+                plugin.Resource("测试站", "电脑版.zip", "https://example.org/pc", "PC"),
+                plugin.Resource(
+                    "测试站", "未标类型.zip", "https://example.org/unknown"
+                ),
+            ],
+        )
+        star.sites.library = AsyncMock(side_effect=httpx.ReadTimeout("test failure"))
+        await self.send(star, "查找千恋万花")
+        missing = await self.send(star, "1 3", target=None)
+        self.assertIn("未找到《千恋万花》的 APK / iOS 资源", missing[0])
+        self.assertIn("7", missing[0])
+        self.assertIn("部分站点暂时无法查询", missing[0])
+        self.assertNotIn("https://example.org/", missing[0])
+        result = await self.send(star, "7,1", target=None)
+        self.assertIn("共 2 条资源", result[0])
+        self.assertIn("https://example.org/pc", result[0])
+        self.assertIn("https://example.org/unknown", result[0])
+
+    async def test_ios_and_emulator_labels_are_detected_without_guessing_unmarked_types(
+        self,
+    ):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        work = plugin.Work("v1", "千恋万花", ("千恋万花",))
+        star.titles.find = AsyncMock(return_value=[work])
+        filenames = [
+            "千恋万花.ipa",
+            "千恋万花_iOS.zip",
+            "千恋万花_Tyranor.zip",
+            "千恋万花_吉里吉里2.zip",
+            "千恋万花_ONScripter.zip",
+            "千恋万花_安卓.zip",
+            "千恋万花.zip",
+        ]
+        resources = [
+            plugin.Resource(
+                "测试站",
+                name,
+                f"https://example.org/{i}",
+                sources.type_label(name),
+                True,
+            )
+            for i, name in enumerate(filenames)
+        ]
+        self.stub_resources(star, resources)
+        for choice, expected in (("3", {0, 1}), ("4", {2}), ("5", {3}), ("6", {4})):
+            with self.subTest(choice=choice):
+                await self.send(star, "查找千恋万花")
+                result = await self.send(star, choice, target=None)
+                self.assertIn("文件名标注", result[0])
+                for index in range(len(filenames)):
+                    self.assertEqual(
+                        f"https://example.org/{index}" in result[0], index in expected
+                    )
+        await self.send(star, "查找千恋万花")
+        star.replies[("test:GroupMessage:1", "42")].expires_at = monotonic() - 1
+        self.assertEqual(await self.send(star, "3", target=None), [])
+
     async def test_manual_reminder_sends_once_and_persists_reset_before_sending(self):
         with TemporaryDirectory() as directory:
             config_path = Path(directory) / "plugin_config.json"
@@ -438,6 +636,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(text=text):
                     replies = await send(text)
                     self.assertEqual(len(replies), 1)
+                    self.assertIn("支持多选", replies[0])
+                    replies = await send("7")
+                    self.assertEqual(len(replies), 1)
                     self.assertIn(
                         "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[0]
                     )
@@ -461,6 +662,8 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             )
             star.sites.search.reset_mock()
             replies = await send("天使")
+            self.assertIn("支持多选", replies[0])
+            replies = await send("7")
             self.assertIn("2. 天使☆嚣嚣 RE-BOOT!\n3. 银河天使", replies[0])
             star.sites.search.assert_not_awaited()
 
@@ -476,7 +679,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         config = {"touchgal_api_token": ""}
         star = handler(SimpleNamespace(), config)
         self.addAsyncCleanup(star.terminate)
-        star.titles.find = AsyncMock(return_value=[])
+        star.titles.find = AsyncMock(
+            return_value=[plugin.Work("v1", "千恋万花", ("千恋万花",))]
+        )
         star.sites.search = AsyncMock(
             return_value=(
                 [
@@ -515,7 +720,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reply(event("查找千恋万花", handlers={"other": {}})), [])
         star.sites.search.assert_not_awaited()
 
-        first = await reply(event("我想玩千恋万花"))
+        prompt = await reply(event("我想玩千恋万花"))
+        self.assertIn("支持多选", prompt[0])
+        star.sites.search.assert_not_awaited()
+        first = await reply(event("7"))
         self.assertIn("第 1 / 2 页", first[0])
         self.assertIn("再输入「下一页」并发送", first[0])
         self.assertNotIn("@BOT", first[0])
@@ -543,7 +751,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda title: [work] if work.matches(title) else []
         )
 
-        async def search(terms):
+        async def search(terms, *, platforms=frozenset()):
             if "Senren Banka" in terms:
                 return [
                     plugin.Resource("测试站", work.title, "https://example.org/file")
@@ -567,6 +775,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 replies = [result async for result in star.on_group_message(event)]
+                self.assertEqual(len(replies), 1)
+                self.assertIn("支持多选", replies[0])
+                replies = await self.send(star, "7", target=None)
                 self.assertEqual(len(replies), 1)
                 self.assertTrue(replies[0].startswith("找到《千恋＊万花》"), replies[0])
                 star.sites.search.assert_awaited_once()
