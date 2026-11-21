@@ -247,10 +247,15 @@ class GalLink(Star):
             )
         ):
             options = tuple(candidates.values())[:5]
-            numbers = " 或 ".join(f"「@BOT {i}」" for i in range(1, len(options) + 1))
             lines = [f"「{query}」可能对应以下作品。", ""]
             lines.extend(f"{i}. {item.title}" for i, item in enumerate(options, 1))
-            lines.extend(["", f"发送 {numbers} 查询对应作品的资源。"])
+            lines.extend(
+                [
+                    "",
+                    "请用 QQ 的 @ 功能选中本机器人，再输入对应的作品编号并发送（例如数字 1）。",
+                    "请由发起查询的群友在 10 分钟内操作。",
+                ]
+            )
             return "\n".join(lines), ReplyState(0, candidates=options)
 
         if work is None and short:
@@ -335,7 +340,13 @@ class GalLink(Star):
                 lines.append(f"类型  {item.type_label}{origin}")
             lines.append(f"{item.link_label}  {item.url}")
         if last < total:
-            lines.extend(["", f"还有 {total - last} 条资源，发送「@BOT 下一页」查看。"])
+            lines.extend(
+                [
+                    "",
+                    f"还有 {total - last} 条资源。请用 QQ 的 @ 功能选中本机器人，再输入「下一页」并发送。",
+                    "请由发起查询的群友在 10 分钟内操作。",
+                ]
+            )
         elif pages > 1:
             lines.extend(["", "已到最后一页。"])
         return "\n".join(lines)

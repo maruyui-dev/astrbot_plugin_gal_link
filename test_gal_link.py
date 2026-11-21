@@ -84,7 +84,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(
                         "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[0]
                     )
-                    self.assertIn("@BOT 2", replies[0])
+                    self.assertIn("请用 QQ 的 @ 功能选中本机器人", replies[0])
+                    self.assertIn("发起查询的群友", replies[0])
+                    self.assertNotIn("@BOT", replies[0])
             self.assertIn("星 白", queries)
             self.assertEqual(await send("1", sender="43"), [])
             star.sites.search.assert_not_awaited()
@@ -155,6 +157,8 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
 
         first = await reply(event("我想玩千恋万花"))
         self.assertIn("第 1 / 2 页", first[0])
+        self.assertIn("再输入「下一页」并发送", first[0])
+        self.assertNotIn("@BOT", first[0])
         self.assertEqual(await reply(event("下一页", sender="43")), [])
         second = await reply(event("下一页"))
         self.assertIn("已到最后一页", second[0])
@@ -242,7 +246,8 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
 
         message, state = await star.lookup("test", "星空与白", None, implicit=True)
         self.assertIn("1. 星空列车与白的旅行\n2. 星空的记忆", message)
-        self.assertIn("@BOT 2", message)
+        self.assertIn("对应的作品编号", message)
+        self.assertNotIn("@BOT", message)
         self.assertNotIn("杜撰作品", message)
         chosen = state.candidates[0]
         message, _ = await star.lookup("test", chosen.title, chosen)
