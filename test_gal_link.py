@@ -19,6 +19,50 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_acknowledgement_is_yielded_before_slow_lookup_starts(self):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        star.replies[("test:GroupMessage:1", "42")] = plugin.ReplyState(
+            monotonic() + 600, title="千恋万花", awaiting_platform=True
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def lookup(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return "查询完成", None
+
+        star.lookup = AsyncMock(side_effect=lookup)
+        event = SimpleNamespace(
+            unified_msg_origin="test:GroupMessage:1",
+            get_sender_id=lambda: "42",
+            get_self_id=lambda: "123",
+            get_platform_name=lambda: "aiocqhttp",
+            get_messages=lambda: [Plain("1 2")],
+            get_extra=lambda key: None,
+            plain_result=lambda message: SimpleNamespace(use_t2i=lambda _: message),
+        )
+        stream = star.on_group_message(event)
+        pending = None
+        try:
+            first = await asyncio.wait_for(anext(stream), 1)
+            self.assertEqual(first, "收到，正在查找《千恋万花》的资源，请稍等。")
+            star.lookup.assert_not_awaited()
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.wait_for(started.wait(), 1)
+            self.assertFalse(pending.done())
+            release.set()
+            self.assertEqual(await asyncio.wait_for(pending, 1), "查询完成")
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+        finally:
+            release.set()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+            await stream.aclose()
+
     def stub_resources(self, star, resources):
         star.sites.shinnku = AsyncMock(return_value=resources)
         star.sites.library = AsyncMock(return_value=[])
@@ -81,8 +125,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1～7", invalid[0])
         star.sites.search.assert_not_awaited()
         first = await self.send(star, "１，２、１", target=None)
-        self.assertIn("共 4 条资源 · 第 1 / 2 页", first[0])
-        self.assertIn("APK / Windows", first[0])
+        self.assertEqual(len(first), 2)
+        self.assertIn("正在查找《千恋万花》", first[0])
+        self.assertIn("共 4 条资源 · 第 1 / 2 页", first[-1])
+        self.assertIn("APK / Windows", first[-1])
         self.assertEqual(await self.send(star, "下一页", sender="43"), [])
         last = await self.send(star, "下一页")
         self.assertIn("已到最后一页", last[0])
@@ -112,13 +158,13 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         prompt = await self.send(star, "查找星白")
         self.assertIn("支持多选", prompt[0])
         candidates = await self.send(star, "1", target=None)
-        self.assertIn("1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", candidates[0])
+        self.assertIn("1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", candidates[-1])
         star.sites.search.assert_not_awaited()
         self.assertEqual(await self.send(star, "1", target=None), [])
         await self.send(star, "")
         result = await self.send(star, "1", target=None)
-        self.assertIn("https://example.org/apk", result[0])
-        self.assertNotIn("https://example.org/pc", result[0])
+        self.assertIn("https://example.org/apk", result[-1])
+        self.assertNotIn("https://example.org/pc", result[-1])
         star.sites.search.assert_awaited_once()
 
     async def test_other_platform_chinese_hits_do_not_block_foreign_fallback(self):
@@ -141,9 +187,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         star.sites.openlist = AsyncMock(return_value=[])
         await self.send(star, "查找千恋万花")
         result = await self.send(star, "1", target=None)
-        self.assertEqual(len(result), 1)
-        self.assertIn("https://example.org/apk", result[0])
-        self.assertNotIn("https://example.org/pc", result[0])
+        self.assertEqual(len(result), 2)
+        self.assertIn("https://example.org/apk", result[-1])
+        self.assertNotIn("https://example.org/pc", result[-1])
         self.assertEqual(phases, [("千恋万花",), ("Senren Banka",)])
 
     async def test_missing_platform_keeps_selection_open_and_all_platforms_can_retry(
@@ -165,14 +211,14 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         star.sites.library = AsyncMock(side_effect=httpx.ReadTimeout("test failure"))
         await self.send(star, "查找千恋万花")
         missing = await self.send(star, "1 3", target=None)
-        self.assertIn("未找到《千恋万花》的 APK / iOS 资源", missing[0])
-        self.assertIn("7", missing[0])
-        self.assertIn("部分站点暂时无法查询", missing[0])
-        self.assertNotIn("https://example.org/", missing[0])
+        self.assertIn("未找到《千恋万花》的 APK / iOS 资源", missing[-1])
+        self.assertIn("7", missing[-1])
+        self.assertIn("部分站点暂时无法查询", missing[-1])
+        self.assertNotIn("https://example.org/", missing[-1])
         result = await self.send(star, "7,1", target=None)
-        self.assertIn("共 2 条资源", result[0])
-        self.assertIn("https://example.org/pc", result[0])
-        self.assertIn("https://example.org/unknown", result[0])
+        self.assertIn("共 2 条资源", result[-1])
+        self.assertIn("https://example.org/pc", result[-1])
+        self.assertIn("https://example.org/unknown", result[-1])
 
     async def test_ios_and_emulator_labels_are_detected_without_guessing_unmarked_types(
         self,
@@ -208,10 +254,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(choice=choice):
                 await self.send(star, "查找千恋万花")
                 result = await self.send(star, choice, target=None)
-                self.assertIn("文件名标注", result[0])
+                self.assertIn("文件名标注", result[-1])
                 for index in range(len(filenames)):
                     self.assertEqual(
-                        f"https://example.org/{index}" in result[0], index in expected
+                        f"https://example.org/{index}" in result[-1], index in expected
                     )
         await self.send(star, "查找千恋万花")
         star.replies[("test:GroupMessage:1", "42")].expires_at = monotonic() - 1
@@ -556,7 +602,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await send("你好", target=None), [])
         self.assertEqual(await send("2", target=None, handlers={"other": {}}), [])
         self.assertIn("1～2", (await send("9", target=None))[0])
-        self.assertEqual(await send("2", target=None), ["已查询作品乙"])
+        self.assertEqual(
+            await send("2", target=None),
+            ["收到，正在查找《作品乙》的资源，请稍等。", "已查询作品乙"],
+        )
         self.assertEqual(star.lookup.await_args.args[2], works[1])
         self.assertEqual(await send("2", target=None), [])
         star.lookup.assert_awaited_once()
@@ -638,13 +687,13 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(replies), 1)
                     self.assertIn("支持多选", replies[0])
                     replies = await send("7")
-                    self.assertEqual(len(replies), 1)
+                    self.assertEqual(len(replies), 2)
                     self.assertIn(
-                        "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[0]
+                        "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[-1]
                     )
-                    self.assertIn("请用 QQ 的 @ 功能选中本机器人", replies[0])
-                    self.assertIn("发起查询的群友", replies[0])
-                    self.assertNotIn("@BOT", replies[0])
+                    self.assertIn("请用 QQ 的 @ 功能选中本机器人", replies[-1])
+                    self.assertIn("发起查询的群友", replies[-1])
+                    self.assertNotIn("@BOT", replies[-1])
             self.assertIn("星 白", queries)
             self.assertEqual(await send("1", sender="43"), [])
             star.sites.search.assert_not_awaited()
@@ -664,7 +713,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             replies = await send("天使")
             self.assertIn("支持多选", replies[0])
             replies = await send("7")
-            self.assertIn("2. 天使☆嚣嚣 RE-BOOT!\n3. 银河天使", replies[0])
+            self.assertIn("2. 天使☆嚣嚣 RE-BOOT!\n3. 银河天使", replies[-1])
             star.sites.search.assert_not_awaited()
 
     async def test_group_message_gate_and_reply_state(self):
@@ -724,9 +773,9 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("支持多选", prompt[0])
         star.sites.search.assert_not_awaited()
         first = await reply(event("7"))
-        self.assertIn("第 1 / 2 页", first[0])
-        self.assertIn("再输入「下一页」并发送", first[0])
-        self.assertNotIn("@BOT", first[0])
+        self.assertIn("第 1 / 2 页", first[-1])
+        self.assertIn("再输入「下一页」并发送", first[-1])
+        self.assertNotIn("@BOT", first[-1])
         self.assertEqual(await reply(event("下一页", sender="43")), [])
         second = await reply(event("下一页"))
         self.assertIn("已到最后一页", second[0])
@@ -778,8 +827,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(replies), 1)
                 self.assertIn("支持多选", replies[0])
                 replies = await self.send(star, "7", target=None)
-                self.assertEqual(len(replies), 1)
-                self.assertTrue(replies[0].startswith("找到《千恋＊万花》"), replies[0])
+                self.assertEqual(len(replies), 2)
+                self.assertTrue(
+                    replies[-1].startswith("找到《千恋＊万花》"), replies[-1]
+                )
                 star.sites.search.assert_awaited_once()
                 if text.startswith("查找一下"):
                     context.llm_generate.assert_not_awaited()

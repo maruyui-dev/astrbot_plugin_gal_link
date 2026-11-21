@@ -235,7 +235,7 @@ class GalLink(Star):
             event: The incoming AstrBot group message.
 
         Yields:
-            A single plain-text Gal Link reply when the message is handled.
+            A progress acknowledgement before a search, followed by its reply.
         """
         if not MentionedGalRequest().filter(event, {}):
             return
@@ -328,6 +328,10 @@ class GalLink(Star):
             state.awaiting_number = False
             state.awaiting_platform = False
         try:
+            if not ask_platform:
+                yield event.plain_result(
+                    f"收到，正在查找《{query}》的资源，请稍等。"
+                ).use_t2i(False)
             response, state = await self.lookup(
                 event.unified_msg_origin,
                 query,
