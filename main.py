@@ -299,7 +299,20 @@ class GalLink(Star):
             return f"暂未找到与「{query}」相关的作品，请试试完整作品名。", None
 
         search_title = work.title if work and not work.matches(query) else query
-        resources, failed = await self.sites.search(search_terms(search_title, work))
+        terms = search_terms(search_title, work)
+        chinese_keys = (
+            {title_key(name) for name in work.chinese_names} if work else set()
+        )
+        preferred = tuple(term for term in terms if title_key(term) in chinese_keys)
+        if preferred:
+            fallback = tuple(
+                term for term in terms if title_key(term) not in chinese_keys
+            )
+            resources, failed = await self.sites.search(
+                preferred, fallback_terms=fallback
+            )
+        else:
+            resources, failed = await self.sites.search(terms)
         if resources:
             state = ReplyState(
                 0, title=work.title if work else query, resources=tuple(resources)

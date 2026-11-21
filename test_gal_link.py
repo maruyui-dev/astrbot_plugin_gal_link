@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import unittest
@@ -13,6 +14,93 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sites_run_concurrently_and_fall_back_only_after_chinese_misses(self):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+        chinese = ("甜蜜女友",)
+        foreign = ("アマカノ", "Amakano")
+        calls = {}
+        started = asyncio.Event()
+
+        async def query(source, terms, keys):
+            calls.setdefault(source, []).append(terms)
+            self.assertEqual(keys, {"甜蜜女友", "アマカノ", "amakano"})
+            if terms == chinese:
+                if len(calls) == 5:
+                    started.set()
+                await asyncio.wait_for(started.wait(), 1)
+                if source not in ("真红小站", "喵喵盘"):
+                    return []
+            else:
+                self.assertEqual(terms, foreign)
+            return [sources.Resource(source, source, f"https://example.org/{source}")]
+
+        async def shinnku(terms, keys):
+            return await query("真红小站", terms, keys)
+
+        async def library(host, source, terms, keys):
+            return await query(source, terms, keys)
+
+        async def openlist(host, source, parent, terms, keys):
+            return await query(source, terms, keys)
+
+        async with httpx.AsyncClient() as client:
+            sites = sources.Sites(client, "", plugin.logger)
+            sites.shinnku = shinnku
+            sites.library = library
+            sites.openlist = openlist
+            found, failed = await sites.search(chinese, fallback_terms=foreign)
+
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(found), 5)
+        for source, phases in calls.items():
+            self.assertEqual(
+                phases,
+                [chinese] if source in ("真红小站", "喵喵盘") else [chinese, foreign],
+            )
+
+    async def test_chinese_alias_is_the_display_name_and_first_search_term(self):
+        async def catalog(request):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": "v15679",
+                            "title": "Amakano",
+                            "alttitle": "アマカノ",
+                            "titles": [{"lang": "ja", "title": "アマカノ"}],
+                            "aliases": ["甜蜜女友"],
+                        }
+                    ]
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(catalog)) as client:
+            work = (await plugin.Titles(client).find("甜蜜女友"))[0]
+        self.assertEqual(work.title, "甜蜜女友")
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        star.titles.find = AsyncMock(return_value=[work])
+        star.sites.search = AsyncMock(
+            return_value=(
+                [
+                    plugin.Resource(
+                        "测试站", "甜蜜女友.zip", "https://example.org/amakano"
+                    ),
+                ],
+                0,
+            )
+        )
+        message, _ = await star.lookup("test", "甜蜜女友", None)
+        self.assertTrue(message.startswith("找到《甜蜜女友》"), message)
+        self.assertEqual(star.sites.search.await_args.args[0], ("甜蜜女友",))
+        self.assertCountEqual(
+            star.sites.search.await_args.kwargs["fallback_terms"],
+            ("アマカノ", "Amakano"),
+        )
+
     async def test_mention_only_arms_number_selection_for_the_original_user(self):
         star = plugin.GalLink(SimpleNamespace())
         self.addAsyncCleanup(star.terminate)
@@ -148,8 +236,11 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             await send("1")
             self.assertEqual(
                 star.sites.search.await_args.args[0],
+                ("星空列车与白的旅行",),
+            )
+            self.assertEqual(
+                star.sites.search.await_args.kwargs["fallback_terms"],
                 (
-                    "星空列车与白的旅行",
                     "星空鉄道とシロの旅",
                     "The Starry Sky Train and Shiro's Journey",
                 ),

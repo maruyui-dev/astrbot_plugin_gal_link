@@ -17,6 +17,7 @@ class Work:
     id: str
     title: str
     names: tuple[str, ...]
+    chinese_names: tuple[str, ...] = ()
 
     def matches(self, title: str) -> bool:
         key = title_key(title)
@@ -55,7 +56,27 @@ class Titles:
         works = []
         for item in response.json()["results"]:
             titles = {entry["lang"]: entry["title"] for entry in item["titles"]}
-            primary = [titles.get(lang) for lang in ("zh-Hans", "ja", "en", "zh-Hant")]
+            chinese = [
+                titles[lang] for lang in ("zh-Hans", "zh-Hant") if lang in titles
+            ]
+            foreign_keys = {
+                title_key(titles[lang]) for lang in ("ja", "en") if lang in titles
+            }
+            # Some works, including Amakano, keep the Chinese name only in aliases.
+            chinese.extend(
+                name
+                for name in item["aliases"]
+                if re.search(r"[\u3400-\u9fff]", name)
+                and not re.search(r"[\u3040-\u30ff]", name)
+                and title_key(name) not in foreign_keys
+            )
+            chinese = list(dict.fromkeys(name for name in chinese if len(name) <= 120))
+            primary = [
+                chinese[0] if chinese else None,
+                titles.get("ja"),
+                titles.get("en"),
+                titles.get("zh-Hant"),
+            ]
             names = tuple(
                 dict.fromkeys(
                     name
@@ -63,13 +84,14 @@ class Titles:
                         *primary,
                         item["title"],
                         item["alttitle"],
+                        *chinese,
                         *item["aliases"],
                     ]
                     if name and len(name) <= 120
                 )
             )
             if names:
-                works.append(Work(item["id"], names[0], names))
+                works.append(Work(item["id"], names[0], names, tuple(chinese)))
         return works
 
 

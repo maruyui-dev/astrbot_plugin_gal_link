@@ -108,34 +108,72 @@ class Sites:
             raise error
         return results
 
-    async def search(self, terms: tuple[str, ...]) -> tuple[list[Resource], int]:
+    async def search(
+        self, terms: tuple[str, ...], *, fallback_terms: tuple[str, ...] = ()
+    ) -> tuple[list[Resource], int]:
         """Search enabled sites concurrently with independent deadlines.
 
         Args:
-            terms: The original search term and known aliases of one work.
+            terms: Preferred Chinese titles and nicknames of one work.
+            fallback_terms: Titles queried only when a site has no preferred matches.
 
         Returns:
             Public resources and the number of sites that could not be searched.
         """
         # Preserve punctuation variants for remote search, but collapse case variants.
         terms = tuple(dict.fromkeys(terms))
-        keys = {title_key(term) for term in terms} - {""}
+        fallback_terms = tuple(
+            term for term in dict.fromkeys(fallback_terms) if term not in terms
+        )
+        keys = {title_key(term) for term in (*terms, *fallback_terms)} - {""}
         tasks = [
-            ("真红小站", self.shinnku(terms, keys)),
-            ("梓澪の妙妙屋", self.library(GAL_GAMES, "梓澪の妙妙屋", terms, keys)),
-            ("喵盘", self.openlist(CATCAT, "喵盘", "/GalGame", terms, keys)),
-            ("喵喵盘", self.openlist(MMPAN, "喵喵盘", "/", terms, keys)),
-            ("稻荷ACG", self.library(INARI, "稻荷ACG", terms, keys)),
+            ("真红小站", self.shinnku, ()),
+            ("梓澪の妙妙屋", self.library, (GAL_GAMES, "梓澪の妙妙屋")),
+            ("喵盘", self.openlist, (CATCAT, "喵盘", "/GalGame")),
+            ("喵喵盘", self.openlist, (MMPAN, "喵喵盘", "/")),
+            ("稻荷ACG", self.library, (INARI, "稻荷ACG")),
         ]
         if self.touchgal_token:
-            tasks.append(("TouchGal", self.touchgal(terms, keys)))
+            tasks.append(("TouchGal", self.touchgal, ()))
+
+        async def search_site(searcher, args):
+            """Query a site with preferred titles before trying fallback titles.
+
+            Args:
+                searcher: The site's existing search coroutine.
+                args: Site-specific arguments preceding the titles and matching keys.
+
+            Returns:
+                The first nonempty phase of resource results.
+            """
+            error = None
+            for phase in (terms, fallback_terms):
+                if not phase:
+                    continue
+                try:
+                    matches = await asyncio.wait_for(searcher(*args, phase, keys), 14)
+                except (
+                    httpx.HTTPError,
+                    TimeoutError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                ) as exc:
+                    error = exc
+                    continue
+                if matches:
+                    return matches
+            if error:
+                raise error
+            return []
+
         batches = await asyncio.gather(
-            *(asyncio.wait_for(task, 14) for _, task in tasks),
+            *(search_site(searcher, args) for _, searcher, args in tasks),
             return_exceptions=True,
         )
         successful = []
         failed = 0
-        for (source, _), batch in zip(tasks, batches, strict=True):
+        for (source, _, _), batch in zip(tasks, batches, strict=True):
             if isinstance(batch, asyncio.CancelledError):
                 raise batch
             if isinstance(batch, Exception):
