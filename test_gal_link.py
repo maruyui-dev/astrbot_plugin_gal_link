@@ -2,9 +2,11 @@ import asyncio
 import importlib
 import json
 import unittest
+from datetime import datetime
 from time import monotonic
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -14,6 +16,125 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reminder_schedule_includes_midnight_and_is_removed_on_unload(self):
+        from apscheduler.triggers.cron import CronTrigger
+
+        manager = SimpleNamespace(
+            add_basic_job=AsyncMock(
+                return_value=SimpleNamespace(job_id="test-reminder")
+            ),
+            delete_job=AsyncMock(),
+        )
+        star = plugin.GalLink(SimpleNamespace(cron_manager=manager))
+        self.addAsyncCleanup(star.terminate)
+        # AstrBot only invokes initialize when the plugin implements it.
+        if hasattr(star, "initialize"):
+            await star.initialize()
+        manager.add_basic_job.assert_awaited_once()
+        await star.initialize()
+        manager.add_basic_job.assert_awaited_once()
+        settings = manager.add_basic_job.await_args.kwargs
+        self.assertEqual(settings["timezone"], "Asia/Shanghai")
+        self.assertIs(settings["persistent"], False)
+        trigger = CronTrigger.from_crontab(
+            settings["cron_expression"], timezone=settings["timezone"]
+        )
+        now = datetime(2026, 11, 20, 6, 59, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        fire = trigger.get_next_fire_time(None, now)
+        hours = []
+        for _ in range(19):
+            hours.append((fire.day, fire.hour, fire.minute))
+            fire = trigger.get_next_fire_time(fire, fire)
+        self.assertEqual(
+            hours, [(20, hour, 0) for hour in range(7, 24)] + [(21, 0, 0), (21, 7, 0)]
+        )
+        await star.terminate()
+        manager.delete_job.assert_awaited_once_with("test-reminder")
+        self.assertTrue(star.client.is_closed)
+
+    async def test_reminders_use_whitelisted_groups_and_a_real_self_mention_without_blank_lines(
+        self,
+    ):
+        clients = {}
+        platforms = {}
+        for platform_id, self_id in (("bot-a", 12345), ("bot-b", 67890)):
+            client = SimpleNamespace(
+                call_action=AsyncMock(
+                    return_value={"user_id": self_id, "nickname": platform_id}
+                )
+            )
+            clients[platform_id] = client
+            platforms[platform_id] = SimpleNamespace(
+                meta=lambda: SimpleNamespace(name="aiocqhttp"),
+                get_client=lambda client=client: client,
+            )
+        context = SimpleNamespace(get_platform_inst=Mock(side_effect=platforms.get))
+        star = plugin.GalLink(
+            context,
+            {
+                "group_broadcast_whitelist": [
+                    "bot-a:GroupMessage:10001",
+                    "bot-a:GroupMessage:10001",
+                    "bot-a:FriendMessage:10002",
+                    "bot-b:GroupMessage:20001",
+                ]
+            },
+        )
+        self.addAsyncCleanup(star.terminate)
+        await star.send_reminders()
+        for platform_id, self_id, group_id in (
+            ("bot-a", 12345, 10001),
+            ("bot-b", 67890, 20001),
+        ):
+            calls = clients[platform_id].call_action.await_args_list
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0].kwargs["action"], "get_login_info")
+            send = calls[1].kwargs
+            self.assertEqual(
+                (send["action"], send["group_id"], send["self_id"]),
+                ("send_group_msg", group_id, self_id),
+            )
+            self.assertEqual(
+                send["message"][1], {"type": "at", "data": {"qq": str(self_id)}}
+            )
+            text = "".join(
+                part["data"]["text"] if part["type"] == "text" else "@" + platform_id
+                for part in send["message"]
+            )
+            self.assertEqual(len(text.splitlines()), 3)
+            self.assertIn(f"例如 @{platform_id} 查找千恋万花", text)
+            self.assertNotIn("\n\n", text)
+            self.assertIn(
+                datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:"), text
+            )
+
+    async def test_empty_whitelist_skips_sending_and_one_failure_keeps_other_groups(
+        self,
+    ):
+        client = SimpleNamespace(call_action=AsyncMock())
+        platform = SimpleNamespace(
+            meta=lambda: SimpleNamespace(name="aiocqhttp"), get_client=lambda: client
+        )
+        context = SimpleNamespace(get_platform_inst=Mock(return_value=platform))
+        config = {"group_broadcast_whitelist": []}
+        star = plugin.GalLink(context, config)
+        self.addAsyncCleanup(star.terminate)
+        await star.send_reminders()
+        context.get_platform_inst.assert_not_called()
+        client.call_action.side_effect = [
+            {"user_id": 12345, "nickname": "test"},
+            RuntimeError("test send failure"),
+            {"user_id": 12345, "nickname": "test"},
+            {"message_id": 1},
+        ]
+        config["group_broadcast_whitelist"] = [
+            "bot:GroupMessage:10001",
+            "bot:GroupMessage:10002",
+        ]
+        await star.send_reminders()
+        self.assertEqual(client.call_action.await_count, 4)
+        self.assertEqual(client.call_action.await_args.kwargs["group_id"], 10002)
+
     async def test_sites_run_concurrently_and_fall_back_only_after_chinese_misses(self):
         sources = importlib.import_module(
             "data.plugins.astrbot_plugin_gal_link.sources"

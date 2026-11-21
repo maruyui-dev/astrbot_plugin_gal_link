@@ -3,7 +3,9 @@ import json
 import re
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from datetime import datetime
 from time import monotonic
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -115,6 +117,8 @@ class MentionedGalRequest(filter.CustomFilter):
 class GalLink(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
+        self.plugin_config = config if config is not None else {}
+        self.reminder_job_id: str | None = None
         self.client = httpx.AsyncClient(
             timeout=6, limits=httpx.Limits(max_connections=20)
         )
@@ -125,10 +129,73 @@ class GalLink(Star):
         self.replies = REPLY_STATES
         self.active: dict[tuple[str, str], object] = {}
 
+    async def initialize(self) -> None:
+        """Register the Beijing-time hourly reminder with AstrBot's scheduler."""
+        if self.reminder_job_id is not None:
+            return
+        job = await self.context.cron_manager.add_basic_job(
+            name="Gal Link · 资源查询整点提醒",
+            cron_expression="0 0,7-23 * * *",
+            timezone="Asia/Shanghai",
+            handler=self.send_reminders,
+            persistent=False,
+        )
+        self.reminder_job_id = job.job_id
+
     async def terminate(self) -> None:
-        self.replies.clear()
-        self.active.clear()
-        await self.client.aclose()
+        """Remove the reminder, drain active sends and close plugin resources."""
+        try:
+            if self.reminder_job_id is not None:
+                await self.context.cron_manager.delete_job(self.reminder_job_id)
+                self.reminder_job_id = None
+        finally:
+            self.replies.clear()
+            self.active.clear()
+            await self.client.aclose()
+
+    async def send_reminders(self) -> None:
+        """Send the approved reminder to each configured OneBot group session."""
+        targets = dict.fromkeys(
+            str(target).strip()
+            for target in self.plugin_config.get("group_broadcast_whitelist", [])
+        )
+        for target in targets:
+            try:
+                platform_id, message_type, session_id = target.split(":", 2)
+                group_id = session_id.rsplit("_", 1)[-1]
+                if (
+                    message_type != "GroupMessage"
+                    or not group_id.isascii()
+                    or not group_id.isdecimal()
+                ):
+                    logger.warning("Gal Link reminder skipped an invalid group session")
+                    continue
+                platform = self.context.get_platform_inst(platform_id)
+                if platform is None or platform.meta().name != "aiocqhttp":
+                    logger.warning(
+                        "Gal Link reminder skipped an unavailable OneBot adapter %s",
+                        platform_id,
+                    )
+                    continue
+                bot = platform.get_client()
+                login = await bot.call_action(action="get_login_info")
+                self_id = int(login["user_id"])
+                now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                message = [
+                    Plain(
+                        "想找哪部 Galgame 的资源，发个游戏名就行，简称也可以。\n例如 "
+                    ),
+                    At(qq=self_id, name=login.get("nickname", "")),
+                    Plain(f" 查找千恋万花\n现在是 {now:%Y-%m-%d %H:%M:%S}。"),
+                ]
+                await bot.call_action(
+                    action="send_group_msg",
+                    group_id=int(group_id),
+                    self_id=self_id,
+                    message=[part.toDict() for part in message],
+                )
+            except Exception as exc:
+                logger.warning("Gal Link reminder failed (%s)", type(exc).__name__)
 
     @filter.custom_filter(MentionedGalRequest)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-50)

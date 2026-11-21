@@ -93,6 +93,20 @@
 
 前五个站点开箱即用。要启用 TouchGal，请在 [开发者门户](https://developer.touchgal.com/) 申请访问，获批后在 AstrBot WebUI 的 Gal Link 插件配置里填写「TouchGal 官方 API Token」。该字段默认为空，官方 API 提供资源页入口。详见 [TouchGal API 文档](https://developer.touchgal.com/docs/api/game-resources)。
 
+## 整点提醒
+
+在 AstrBot WebUI 中打开 Gal Link 的插件配置，在「群发白名单」里选择需要提醒的 QQ 群聊会话，然后保存并重载插件。选择器显示群名和所属机器人，可通过 `/sid` 获取群会话的 UMO，手动添加时使用完整的 `平台实例ID:GroupMessage:群号`。
+
+提醒按北京时间（`Asia/Shanghai`）发送，每天 07:00—23:00 和 00:00 各发送一次，共 18 次。白名单默认为空，填入后仅向选中的群聊发送。该设置用于提醒群发，资源查询按群聊消息正常触发。
+
+提醒示例如下。第二行会真实 @ 发送提醒的机器人，末行使用发送时的北京时间，各行之间没有空行。
+
+```text
+想找哪部 Galgame 的资源，发个游戏名就行，简称也可以。
+例如 @{机器人昵称} 查找千恋万花
+现在是 {当前日期} {当前时间}。
+```
+
 ## 开发与反馈
 
 群消息处理和分页位于 [`main.py`](./main.py)，作品标题匹配位于 [`titles.py`](./titles.py)，站点适配位于 [`sources.py`](./sources.py)。插件放在 `data/plugins/astrbot_plugin_gal_link` 下时，可从 AstrBot 根目录运行测试。

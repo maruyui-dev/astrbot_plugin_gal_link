@@ -1,4 +1,11 @@
 {
+  "group_broadcast_whitelist": {
+    "description": "群发白名单",
+    "type": "list",
+    "default": [],
+    "_special": "umo",
+    "hint": "选择需要提醒的 QQ OneBot 群聊会话。每天北京时间 07:00—23:00 及 00:00 的整点发送一次资源查询提醒，留空时不群发。"
+  },
   "touchgal_api_token": {
     "description": "TouchGal 官方 API Token",
     "type": "string",
