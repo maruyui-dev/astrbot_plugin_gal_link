@@ -130,7 +130,7 @@ class GalLink(Star):
         self.active: dict[tuple[str, str], object] = {}
 
     async def initialize(self) -> None:
-        """Register the Beijing-time hourly reminder with AstrBot's scheduler."""
+        """Register hourly reminders and consume a one-time manual send request."""
         if self.reminder_job_id is not None:
             return
         job = await self.context.cron_manager.add_basic_job(
@@ -141,6 +141,10 @@ class GalLink(Star):
             persistent=False,
         )
         self.reminder_job_id = job.job_id
+        if self.plugin_config.get("send_reminder_now", False):
+            self.plugin_config["send_reminder_now"] = False
+            self.plugin_config.save_config()
+            await self.send_reminders()
 
     async def terminate(self) -> None:
         """Remove the reminder, drain active sends and close plugin resources."""

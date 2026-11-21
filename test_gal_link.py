@@ -3,6 +3,8 @@ import importlib
 import json
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -10,12 +12,103 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from astrbot.api import AstrBotConfig
 from astrbot.api.message_components import At, Plain
 
 plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_reminder_sends_once_and_persists_reset_before_sending(self):
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "plugin_config.json"
+            defaults = {
+                "group_broadcast_whitelist": ["bot:GroupMessage:10001"],
+                "send_reminder_now": False,
+            }
+            config = AstrBotConfig(str(config_path), default_config=defaults)
+            config["send_reminder_now"] = True
+            config.save_config()
+            sent = []
+
+            async def call_action(**kwargs):
+                if kwargs["action"] == "get_login_info":
+                    return {"user_id": 12345, "nickname": "test"}
+                # Reset must reach disk before the first group receives anything.
+                self.assertIs(
+                    json.loads(config_path.read_text(encoding="utf-8-sig"))[
+                        "send_reminder_now"
+                    ],
+                    False,
+                )
+                sent.append(kwargs)
+                return {"message_id": 1}
+
+            client = SimpleNamespace(call_action=call_action)
+            platform = SimpleNamespace(
+                meta=lambda: SimpleNamespace(name="aiocqhttp"),
+                get_client=lambda: client,
+            )
+            context = SimpleNamespace(
+                cron_manager=SimpleNamespace(
+                    add_basic_job=AsyncMock(
+                        return_value=SimpleNamespace(job_id="test-reminder")
+                    ),
+                    delete_job=AsyncMock(),
+                ),
+                get_platform_inst=Mock(return_value=platform),
+            )
+            star = plugin.GalLink(context, config)
+            try:
+                await star.initialize()
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]["group_id"], 10001)
+                self.assertIs(config["send_reminder_now"], False)
+                await star.initialize()
+                self.assertEqual(len(sent), 1)
+            finally:
+                await star.terminate()
+
+            reloaded_config = AstrBotConfig(str(config_path), default_config=defaults)
+            reloaded = plugin.GalLink(context, reloaded_config)
+            try:
+                await reloaded.initialize()
+                self.assertEqual(len(sent), 1)
+            finally:
+                await reloaded.terminate()
+
+    async def test_manual_reminder_with_empty_whitelist_resets_without_sending(self):
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "plugin_config.json"
+            config = AstrBotConfig(
+                str(config_path),
+                default_config={
+                    "group_broadcast_whitelist": [],
+                    "send_reminder_now": True,
+                },
+            )
+            context = SimpleNamespace(
+                cron_manager=SimpleNamespace(
+                    add_basic_job=AsyncMock(
+                        return_value=SimpleNamespace(job_id="test-reminder")
+                    ),
+                    delete_job=AsyncMock(),
+                ),
+                get_platform_inst=Mock(),
+            )
+            star = plugin.GalLink(context, config)
+            try:
+                await star.initialize()
+                self.assertIs(
+                    json.loads(config_path.read_text(encoding="utf-8-sig"))[
+                        "send_reminder_now"
+                    ],
+                    False,
+                )
+                context.get_platform_inst.assert_not_called()
+            finally:
+                await star.terminate()
+
     async def test_reminder_schedule_includes_midnight_and_is_removed_on_unload(self):
         from apscheduler.triggers.cron import CronTrigger
 

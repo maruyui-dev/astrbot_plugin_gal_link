@@ -6,6 +6,12 @@
     "_special": "umo",
     "hint": "选择需要提醒的 QQ OneBot 群聊会话。每天北京时间 07:00—23:00 及 00:00 的整点发送一次资源查询提醒，留空时不群发。"
   },
+  "send_reminder_now": {
+    "description": "立即群发一次",
+    "type": "bool",
+    "default": false,
+    "hint": "开启并保存配置后，立即向「群发白名单」发送一次提醒，不受整点时段限制。请求执行前会自动关闭并保存，重新打开配置可看到复位状态；白名单为空时不发送。"
+  },
   "touchgal_api_token": {
     "description": "TouchGal 官方 API Token",
     "type": "string",
