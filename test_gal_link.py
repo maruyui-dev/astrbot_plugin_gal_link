@@ -1,6 +1,7 @@
 import importlib
 import json
 import unittest
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,60 @@ plugin = importlib.import_module("data.plugins.astrbot_plugin_gal_link.main")
 
 
 class GalLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mention_only_arms_number_selection_for_the_original_user(self):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        works = (
+            plugin.Work("v1", "作品甲", ("作品甲",)),
+            plugin.Work("v2", "作品乙", ("作品乙",)),
+        )
+        key = ("test:GroupMessage:1", "42")
+        star.replies[key] = plugin.ReplyState(monotonic() + 600, candidates=works)
+        star.lookup = AsyncMock(return_value=("已查询作品乙", None))
+
+        async def send(
+            text, sender="42", group="test:GroupMessage:1", target="123", handlers=None
+        ):
+            components = [Plain(text)]
+            if target is not None:
+                components.insert(0, At(qq=target))
+            event = SimpleNamespace(
+                unified_msg_origin=group,
+                get_sender_id=lambda: sender,
+                get_self_id=lambda: "123",
+                get_platform_name=lambda: "aiocqhttp",
+                get_messages=lambda: components,
+                get_extra=lambda key: (
+                    handlers if key == "handlers_parsed_params" else None
+                ),
+                plain_result=lambda message: SimpleNamespace(use_t2i=lambda _: message),
+            )
+            if not plugin.MentionedGalRequest().filter(event, {}):
+                return []
+            return [result async for result in star.on_group_message(event)]
+
+        self.assertEqual(await send("2", target=None), [])
+        self.assertEqual(await send(" ", sender="43"), [])
+        prompt = await send(" ")
+        self.assertEqual(len(prompt), 1)
+        self.assertIn("请直接发送作品序号", prompt[0])
+        self.assertEqual(await send("2", sender="43", target=None), [])
+        self.assertEqual(await send("2", group="test:GroupMessage:2", target=None), [])
+        self.assertEqual(await send("2", target="999"), [])
+        self.assertEqual(await send("你好", target=None), [])
+        self.assertEqual(await send("2", target=None, handlers={"other": {}}), [])
+        self.assertIn("1～2", (await send("9", target=None))[0])
+        self.assertEqual(await send("2", target=None), ["已查询作品乙"])
+        self.assertEqual(star.lookup.await_args.args[2], works[1])
+        self.assertEqual(await send("2", target=None), [])
+        star.lookup.assert_awaited_once()
+
+        star.replies[key] = plugin.ReplyState(monotonic() + 600, candidates=works)
+        await send("")
+        star.replies[key].expires_at = monotonic() - 1
+        self.assertEqual(await send("2", target=None), [])
+        self.assertEqual(await send(""), [])
+
     async def test_short_queries_offer_dynamic_candidates_before_searching_resources(
         self,
     ):

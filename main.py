@@ -63,11 +63,16 @@ class ReplyState:
     candidates: tuple[Work, ...] = ()
     resources: tuple[Resource, ...] = ()
     page: int = 0
+    awaiting_number: bool = False
+
+
+# The synchronous message filter needs the same session state as the handler.
+REPLY_STATES: dict[tuple[str, str], ReplyState] = {}
 
 
 class MentionedGalRequest(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        """Admit only a direct mention with Gal Link request syntax.
+        """Admit mentioned requests and numbers from an active selection prompt.
 
         Args:
             event: The incoming group message.
@@ -79,16 +84,27 @@ class MentionedGalRequest(filter.CustomFilter):
         if event.get_platform_name() != "aiocqhttp":
             return False
         chain = event.get_messages()
+        text = "".join(part.text for part in chain if isinstance(part, Plain)).strip()
         if not any(
             isinstance(part, At) and str(part.qq) == str(event.get_self_id())
             for part in chain
         ):
-            return False
-        text = "".join(part.text for part in chain if isinstance(part, Plain)).strip()
+            if not NUMBER.fullmatch(text) or any(
+                isinstance(part, At) for part in chain
+            ):
+                return False
+            state = REPLY_STATES.get((event.unified_msg_origin, event.get_sender_id()))
+            return bool(
+                state
+                and state.candidates
+                and state.awaiting_number
+                and state.expires_at > monotonic()
+            )
         if text.startswith(("/", "!", "！", "#", ".")):
             return False
         return bool(
-            NUMBER.fullmatch(text)
+            (not text and all(isinstance(part, (At, Plain)) for part in chain))
+            or NUMBER.fullmatch(text)
             or text == "下一页"
             or QUOTED_TITLE.fullmatch(text)
             or (INTENT.search(text) and REQUEST.fullmatch(text))
@@ -106,7 +122,7 @@ class GalLink(Star):
         self.sites = Sites(
             self.client, (config or {}).get("touchgal_api_token", "").strip(), logger
         )
-        self.replies: dict[tuple[str, str], ReplyState] = {}
+        self.replies = REPLY_STATES
         self.active: dict[tuple[str, str], object] = {}
 
     async def terminate(self) -> None:
@@ -136,11 +152,21 @@ class GalLink(Star):
             part.text for part in event.get_messages() if isinstance(part, Plain)
         ).strip()
         now = monotonic()
-        self.replies = {
-            key: state for key, state in self.replies.items() if state.expires_at > now
-        }
+        for expired_key in [
+            key for key, state in self.replies.items() if state.expires_at <= now
+        ]:
+            self.replies.pop(expired_key)
         key = (event.unified_msg_origin, event.get_sender_id())
         state = self.replies.get(key)
+        if not text:
+            if state and state.candidates:
+                state.awaiting_number = True
+                state.expires_at = now + REPLY_TTL
+                yield event.plain_result(
+                    f"请直接发送作品序号（1～{len(state.candidates)}），例如发送「1」。\n"
+                    "本次选择在 10 分钟内有效。"
+                ).use_t2i(False)
+            return
         if text == "下一页":
             if (
                 state
@@ -155,8 +181,14 @@ class GalLink(Star):
         work = None
         if NUMBER.fullmatch(text):
             index = int(text) - 1
-            if state is None or index >= len(state.candidates):
+            if state is None or not state.candidates:
                 return
+            if index >= len(state.candidates):
+                yield event.plain_result(
+                    f"请发送有效的作品序号（1～{len(state.candidates)}）。"
+                ).use_t2i(False)
+                return
+            state.awaiting_number = False
             work = state.candidates[index]
             query = work.title
         else:
@@ -169,6 +201,8 @@ class GalLink(Star):
 
         request = object()
         self.active[key] = request
+        if state:
+            state.awaiting_number = False
         try:
             response, state = await self.lookup(
                 event.unified_msg_origin,
@@ -253,6 +287,7 @@ class GalLink(Star):
                 [
                     "",
                     "请用 QQ 的 @ 功能选中本机器人，再输入对应的作品编号并发送（例如数字 1）。",
+                    "也可以先单独 @ 本机器人，收到序号提示后直接发送数字。",
                     "请由发起查询的群友在 10 分钟内操作。",
                 ]
             )
