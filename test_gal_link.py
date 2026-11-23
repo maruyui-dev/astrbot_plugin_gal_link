@@ -130,7 +130,12 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("共 4 条资源 · 第 1 / 2 页", first[-1])
         self.assertIn("APK / Windows", first[-1])
         self.assertEqual(await self.send(star, "下一页", sender="43"), [])
-        last = await self.send(star, "下一页")
+        self.assertEqual(await self.send(star, "下一页", sender="43", target=None), [])
+        self.assertEqual(
+            await self.send(star, "下一页", group="test:GroupMessage:2", target=None),
+            [],
+        )
+        last = await self.send(star, "下一页", target=None)
         self.assertIn("已到最后一页", last[0])
         combined = "\n".join(first + last)
         for index in (0, 1, 4, 5):
@@ -139,6 +144,30 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(f"https://example.org/{index}", combined)
         self.assertEqual(await self.send(star, "1 2", target=None), [])
         star.sites.search.assert_awaited_once()
+
+    async def test_platform_prompt_reminds_once_and_accepts_zero_to_exit(self):
+        star = plugin.GalLink(SimpleNamespace())
+        self.addAsyncCleanup(star.terminate)
+        star.sites.search = AsyncMock()
+        prompt = await self.send(star, "查找千恋万花")
+        self.assertIn("0. 退出", prompt[0])
+        self.assertEqual(await self.send(star, "安卓", sender="43", target=None), [])
+        self.assertEqual(await self.send(star, "/其他指令", target=None), [])
+        self.assertEqual(await self.send(star, "安卓", target="999"), [])
+        self.assertEqual(
+            await self.send(star, "安卓", target=None, handlers={"other": {}}), []
+        )
+        reminder = await self.send(star, "安卓", target=None)
+        self.assertIn("请发送数字序号", reminder[0])
+        self.assertEqual(await self.send(star, "我看看", target=None), [])
+        invalid = await self.send(star, "0 1", target=None)
+        self.assertIn("单独发送「0」", invalid[0])
+        self.assertIn("已退出", (await self.send(star, "0", target=None))[0])
+        self.assertEqual(await self.send(star, "1", target=None), [])
+        self.assertEqual(await self.send(star, "1"), [])
+        await self.send(star, "查找千恋万花")
+        self.assertIn("已退出", (await self.send(star, "０"))[0])
+        star.sites.search.assert_not_awaited()
 
     async def test_platform_choice_survives_work_disambiguation(self):
         star = plugin.GalLink(SimpleNamespace())
@@ -160,8 +189,8 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         candidates = await self.send(star, "1", target=None)
         self.assertIn("1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", candidates[-1])
         star.sites.search.assert_not_awaited()
-        self.assertEqual(await self.send(star, "1", target=None), [])
-        await self.send(star, "")
+        self.assertIn("0. 退出", candidates[-1])
+        self.assertEqual(await self.send(star, "1", target=None, sender="43"), [])
         result = await self.send(star, "1", target=None)
         self.assertIn("https://example.org/apk", result[-1])
         self.assertNotIn("https://example.org/pc", result[-1])
@@ -559,7 +588,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             ("アマカノ", "Amakano"),
         )
 
-    async def test_mention_only_arms_number_selection_for_the_original_user(self):
+    async def test_mention_only_repeats_work_selection_instructions(self):
         star = plugin.GalLink(SimpleNamespace())
         self.addAsyncCleanup(star.terminate)
         works = (
@@ -591,7 +620,6 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                 return []
             return [result async for result in star.on_group_message(event)]
 
-        self.assertEqual(await send("2", target=None), [])
         self.assertEqual(await send(" ", sender="43"), [])
         prompt = await send(" ")
         self.assertEqual(len(prompt), 1)
@@ -691,7 +719,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(
                         "1. 星空列车与白的旅行\n2. 星辰恋曲的白色永恒", replies[-1]
                     )
-                    self.assertIn("请用 QQ 的 @ 功能选中本机器人", replies[-1])
+                    self.assertIn("直接回复作品序号", replies[-1])
                     self.assertIn("发起查询的群友", replies[-1])
                     self.assertNotIn("@BOT", replies[-1])
             self.assertIn("星 白", queries)
@@ -774,7 +802,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         star.sites.search.assert_not_awaited()
         first = await reply(event("7"))
         self.assertIn("第 1 / 2 页", first[-1])
-        self.assertIn("再输入「下一页」并发送", first[-1])
+        self.assertIn("直接发送「下一页」", first[-1])
         self.assertNotIn("@BOT", first[-1])
         self.assertEqual(await reply(event("下一页", sender="43")), [])
         second = await reply(event("下一页"))
@@ -868,7 +896,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
 
         message, state = await star.lookup("test", "星空与白", None, implicit=True)
         self.assertIn("1. 星空列车与白的旅行\n2. 星空的记忆", message)
-        self.assertIn("对应的作品编号", message)
+        self.assertIn("直接回复作品序号", message)
         self.assertNotIn("@BOT", message)
         self.assertNotIn("杜撰作品", message)
         chosen = state.candidates[0]

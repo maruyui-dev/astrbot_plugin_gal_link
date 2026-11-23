@@ -37,7 +37,7 @@ INTENT = re.compile(
     r"我要\s*(?:玩|找|下载)|想玩|找一下|找找|查找|查一下|搜一下|搜索|(?:求|给我|发我|有没有|能不能).*(?:资源|下载|安装包|游戏本体))"
     r"|(?:安装包|游戏本体|下载链接|资源链接|游戏资源|下载地址)[。！？?!]?$"
 )
-NUMBER = re.compile(r"[1-9１-９]")
+NUMBER = re.compile(r"[0-9０-９]")
 PLATFORM_NUMBERS = re.compile(r"[0-9０-９]+(?:[\s,，、]+[0-9０-９]+)*")
 PLATFORM_NAMES = ("APK", "Windows", "iOS", "Ty", "KRKR", "ONS")
 PLATFORM_PROMPT = (
@@ -49,7 +49,9 @@ PLATFORM_PROMPT = (
     "5. KRKR（吉里吉里模拟器）\n"
     "6. ONS（ONS 模拟器）\n"
     "7. 不限平台\n"
-    "请由发起查询的群友直接回复序号，多选用空格或逗号分隔。\n"
+    "0. 退出\n"
+    "请由发起查询的群友直接回复序号，也可以 @ 本机器人后发送。\n"
+    "多选用空格或逗号分隔。\n"
     "例如：1 2，表示同时查找 APK 和 Windows 资源。\n"
     "选择「7」表示不限平台，本次选择在 10 分钟内有效。"
 )
@@ -80,8 +82,8 @@ class ReplyState:
     candidates: tuple[Work, ...] = ()
     resources: tuple[Resource, ...] = ()
     page: int = 0
-    awaiting_number: bool = False
     awaiting_platform: bool = False
+    platform_reminded: bool = False
     platforms: frozenset[int] = frozenset()
     selected: Work | None = None
 
@@ -92,7 +94,7 @@ REPLY_STATES: dict[tuple[str, str], ReplyState] = {}
 
 class MentionedGalRequest(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        """Admit mentioned requests and numbers from an active selection prompt.
+        """Admit mentioned requests and follow-ups from the active requester.
 
         Args:
             event: The incoming group message.
@@ -105,30 +107,36 @@ class MentionedGalRequest(filter.CustomFilter):
             return False
         chain = event.get_messages()
         text = "".join(part.text for part in chain if isinstance(part, Plain)).strip()
-        state = REPLY_STATES.get((event.unified_msg_origin, event.get_sender_id()))
-        platform_reply = bool(
-            state and state.awaiting_platform and state.expires_at > monotonic()
-        )
-        if not any(
-            isinstance(part, At) and str(part.qq) == str(event.get_self_id())
-            for part in chain
-        ):
-            if any(isinstance(part, At) for part in chain):
-                return False
-            if platform_reply:
-                return bool(PLATFORM_NUMBERS.fullmatch(text))
-            return bool(
-                NUMBER.fullmatch(text)
-                and state
-                and state.candidates
-                and state.awaiting_number
-                and state.expires_at > monotonic()
-            )
         if text.startswith(("/", "!", "！", "#", ".")):
+            return False
+        bot_id = str(event.get_self_id())
+        mentioned = any(
+            isinstance(part, At) and str(part.qq) == bot_id for part in chain
+        )
+        state = REPLY_STATES.get((event.unified_msg_origin, event.get_sender_id()))
+        if (
+            state
+            and state.expires_at > monotonic()
+            and text
+            and all(
+                isinstance(part, Plain)
+                or (isinstance(part, At) and str(part.qq) == bot_id)
+                for part in chain
+            )
+        ):
+            if state.awaiting_platform:
+                if PLATFORM_NUMBERS.fullmatch(text) or not state.platform_reminded:
+                    return True
+            elif state.candidates and NUMBER.fullmatch(text):
+                return True
+            elif text == "下一页" and (state.page + 1) * PAGE_SIZE < len(
+                state.resources
+            ):
+                return True
+        if not mentioned:
             return False
         return bool(
             (not text and all(isinstance(part, (At, Plain)) for part in chain))
-            or (platform_reply and PLATFORM_NUMBERS.fullmatch(text))
             or NUMBER.fullmatch(text)
             or text == "下一页"
             or QUOTED_TITLE.fullmatch(text)
@@ -257,14 +265,14 @@ class GalLink(Star):
                 state.expires_at = now + REPLY_TTL
                 yield event.plain_result(PLATFORM_PROMPT).use_t2i(False)
             elif state and state.candidates:
-                state.awaiting_number = True
                 state.expires_at = now + REPLY_TTL
                 yield event.plain_result(
                     f"请直接发送作品序号（1～{len(state.candidates)}），例如发送「1」。\n"
+                    "可以直接回复或 @ 本机器人后发送，回复「0」退出。\n"
                     "本次选择在 10 分钟内有效。"
                 ).use_t2i(False)
             return
-        if text == "下一页":
+        if text == "下一页" and not (state and state.awaiting_platform):
             if (
                 state
                 and state.resources
@@ -273,6 +281,11 @@ class GalLink(Star):
                 state.page += 1
                 state.expires_at = now + REPLY_TTL
                 yield event.plain_result(self.render(state)).use_t2i(False)
+            return
+        if text in {"0", "０"}:
+            if state and (state.awaiting_platform or state.candidates):
+                self.replies.pop(key, None)
+                yield event.plain_result("已退出本次资源查询。").use_t2i(False)
             return
 
         work = None
@@ -284,11 +297,14 @@ class GalLink(Star):
                 r"[\s,，、]+",
                 text.translate(str.maketrans("０１２３４５６７８９", "0123456789")),
             )
+            if "0" in tokens:
+                yield event.plain_result("如需退出，请单独发送「0」。").use_t2i(False)
+                return
             if any(
                 token not in {"1", "2", "3", "4", "5", "6", "7"} for token in tokens
             ):
                 yield event.plain_result(
-                    "请发送有效的平台序号（1～7），支持多选，例如「1 2」；选择「7」表示不限平台。"
+                    "请发送有效的平台序号（1～7），多选如「1 2」，回复「0」退出。"
                 ).use_t2i(False)
                 return
             platforms = (
@@ -299,22 +315,34 @@ class GalLink(Star):
             work = state.selected
             known_works = state.candidates
             query = state.title
-            state.awaiting_platform = False
         elif NUMBER.fullmatch(text):
             index = int(text) - 1
             if state is None or not state.candidates:
                 return
             if index >= len(state.candidates):
                 yield event.plain_result(
-                    f"请发送有效的作品序号（1～{len(state.candidates)}）。"
+                    f"请发送有效的作品序号（1～{len(state.candidates)}），或回复「0」退出。"
                 ).use_t2i(False)
                 return
-            state.awaiting_number = False
             work = state.candidates[index]
             query = work.title
             platforms = state.platforms
         else:
-            match = QUOTED_TITLE.fullmatch(text) or REQUEST.fullmatch(text)
+            quoted = QUOTED_TITLE.fullmatch(text)
+            match = quoted or REQUEST.fullmatch(text)
+            if state and state.awaiting_platform:
+                # A clearly addressed new search may replace the pending selection.
+                explicit_query = (quoted or (match and INTENT.search(text))) and any(
+                    isinstance(part, At) and str(part.qq) == str(event.get_self_id())
+                    for part in event.get_messages()
+                )
+                if not explicit_query:
+                    if not state.platform_reminded:
+                        state.platform_reminded = True
+                        yield event.plain_result(
+                            "请发送数字序号选择平台或运行方式，多选如「1 2」，回复「0」退出。"
+                        ).use_t2i(False)
+                    return
             if match is None:
                 return
             query = match.group("title").strip(' \t《》「」『』“”"')
@@ -324,9 +352,7 @@ class GalLink(Star):
 
         request = object()
         self.active[key] = request
-        if state:
-            state.awaiting_number = False
-            state.awaiting_platform = False
+        self.replies.pop(key, None)
         try:
             if not ask_platform:
                 yield event.plain_result(
@@ -449,11 +475,11 @@ class GalLink(Star):
             options = tuple(candidates.values())[:5]
             lines = [f"「{query}」可能对应以下作品。", ""]
             lines.extend(f"{i}. {item.title}" for i, item in enumerate(options, 1))
+            lines.append("0. 退出")
             lines.extend(
                 [
                     "",
-                    "请用 QQ 的 @ 功能选中本机器人，再输入对应的作品编号并发送（例如数字 1）。",
-                    "也可以先单独 @ 本机器人，收到序号提示后直接发送数字。",
+                    "直接回复作品序号即可，例如「1」，也可以 @ 本机器人后发送。",
                     "请由发起查询的群友在 10 分钟内操作。",
                 ]
             )
@@ -507,6 +533,7 @@ class GalLink(Star):
             reply = (
                 f"暂未找到《{title}》的 {types} 资源。\n"
                 "可直接回复「7」查看不限平台的结果，或回复其他平台序号（支持多选）。\n"
+                "回复「0」退出本次查询。\n"
                 "请由发起查询的群友在 10 分钟内操作。"
             )
             state = ReplyState(
@@ -588,7 +615,7 @@ class GalLink(Star):
             lines.extend(
                 [
                     "",
-                    f"还有 {total - last} 条资源。请用 QQ 的 @ 功能选中本机器人，再输入「下一页」并发送。",
+                    f"还有 {total - last} 条资源。直接发送「下一页」即可，也可以 @ 本机器人后发送。",
                     "请由发起查询的群友在 10 分钟内操作。",
                 ]
             )
