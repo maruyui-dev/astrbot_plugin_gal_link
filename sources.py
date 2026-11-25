@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import zip_longest
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 
@@ -49,6 +49,13 @@ PLATFORM_PATTERNS = tuple(
     )
 )
 SHARE_URL = re.compile(r'https://[^\s<>"「」『』【】。；，！？]+')
+ARCHIVE_PASSWORD = re.compile(
+    r"(?:(?:解压(?:缩)?|压缩)\s*(?:密码|口令|码|密钥)|(?:archive|extraction)\s+password)"
+    r"(?:\*\*)?\s*(?:[:：=]|是|为)\s*"
+    r'(?:[`"“「](?P<quoted>[^`"”」\r\n]{1,100})[`"”」]|'
+    r'(?P<plain>[^\s`"“”「」<>,;，；。！？、\[\]（）]{1,100}))',
+    re.IGNORECASE,
+)
 SHARE_HOSTS = {
     "pan.baidu.com": "百度网盘",
     "pan.quark.cn": "夸克网盘",
@@ -72,6 +79,30 @@ class Resource:
     link_label: str = "下载"
     volumes: tuple["Resource", ...] = ()
     missing_volumes: bool = False
+    archive_passwords: tuple[str, ...] = ()
+
+
+def archive_passwords(note: str) -> tuple[str, ...]:
+    """Read explicitly labelled archive passwords from a public resource note.
+
+    Args:
+        note: Plain text, Markdown or HTML published by the resource site.
+
+    Returns:
+        Distinct archive passwords in the site's order.
+    """
+    if re.search(r"<[a-zA-Z][^>]*>", note):
+        note = BeautifulSoup(note, "html.parser").get_text(" ", strip=True)
+    passwords = {}
+    for match in ARCHIVE_PASSWORD.finditer(note):
+        value = match["quoted"] or match["plain"]
+        if match["plain"] and value.startswith("**") and value.endswith("**"):
+            value = value[2:-2]
+        if value and not re.match(
+            r"^(?:请|详见|见|参考|待补充|未注明|提取码|访问码)", value
+        ):
+            passwords.setdefault(value, None)
+    return tuple(passwords)
 
 
 def volume_info(name: str) -> tuple[str, str, int] | None:
@@ -140,6 +171,9 @@ def group_volumes(
         volumes = tuple(part for _, _, part in parts)
         first = volumes[0]
         kinds = {part.type_label for part in volumes if part.type_label}
+        passwords = {
+            part.archive_passwords for part in volumes if part.archive_passwords
+        }
         replacements[first_path] = Resource(
             first.source,
             volume_info(files[first_path].title)[0],
@@ -150,6 +184,7 @@ def group_volumes(
             min(indices) != 1
             or max(indices) != len(indices)
             or (scheme == "legacy" and companion is None),
+            archive_passwords=next(iter(passwords)) if len(passwords) == 1 else (),
         )
         consumed.update(path for _, path, _ in parts if path != first_path)
     return [
@@ -399,6 +434,7 @@ class Sites:
             url = SHINNKU + path
             response = await self.request("GET", url)
             page = BeautifulSoup(response.text, "html.parser")
+            passwords = archive_passwords(page.get_text(" ", strip=True))
             for link in page.select("a[href]"):
                 if link.get_text(" ", strip=True) == "点击此处下载":
                     target = urljoin(url, link["href"])
@@ -407,9 +443,15 @@ class Sites:
                             urlsplit(target).netloc.lower(), "下载"
                         )
                         return path, Resource(
-                            "真红小站", title, target, link_label=provider
+                            "真红小站",
+                            title,
+                            target,
+                            link_label=provider,
+                            archive_passwords=passwords,
                         )
-            return path, Resource("真红小站", title, url, link_label="资源页")
+            return path, Resource(
+                "真红小站", title, url, link_label="资源页", archive_passwords=passwords
+            )
 
         files = await self.expand_volumes(files, list_folder)
         return group_volumes(
@@ -449,6 +491,7 @@ class Sites:
                     paths.setdefault(item["parent"].rstrip("/") + "/" + name, name)
 
         listed_signs = {}
+        listed_passwords = {}
 
         async def list_folder(folder):
             files = {}
@@ -463,6 +506,10 @@ class Sites:
                 if payload["code"] != 200:
                     raise ValueError("Directory listing not available")
                 data = payload["data"]
+                if page == 1:
+                    listed_passwords[folder] = archive_passwords(
+                        data.get("readme") or ""
+                    ) or archive_passwords(data.get("header") or "")
                 entries = data["content"] or []
                 for entry in entries:
                     name = entry["name"]
@@ -476,6 +523,7 @@ class Sites:
                 page += 1
 
         async def resolve(path, name):
+            passwords = listed_passwords.get(path.rpartition("/")[0], ())
             if path in listed_signs:
                 sign = listed_signs[path]
             else:
@@ -485,19 +533,65 @@ class Sites:
                 payload = response.json()
                 if payload["code"] != 200:
                     return None
-                sign = payload["data"].get("sign")
+                data = payload["data"]
+                sign = data.get("sign")
+                passwords = (
+                    archive_passwords(data.get("readme") or "")
+                    or archive_passwords(data.get("header") or "")
+                    or passwords
+                )
             # Use OpenList's public download route with the signature it supplied.
             url = f"{host}/d{quote(path, safe='/')}"
             if sign:
                 url += f"?sign={quote(sign, safe='')}"
-            return path, Resource(source, name, url)
+            return path, Resource(source, name, url, archive_passwords=passwords)
 
         paths = await self.expand_volumes(paths, list_folder)
         resolved = await self.gather(
             resolve(path, name) for path, name in paths.items()
         )
+        resources = dict(item for item in resolved if item is not None)
+        if (
+            host == CATCAT
+            and parent == "/GalGame"
+            and any(
+                path.startswith("/GalGame/") and not item.archive_passwords
+                for path, item in resources.items()
+            )
+        ):
+            try:
+                response = await self.request(
+                    "POST",
+                    f"{host}/api/fs/list",
+                    json={"path": "/", "page": 1, "per_page": 1},
+                    timeout=3,
+                )
+                payload = response.json()
+                if payload["code"] == 200:
+                    notes = BeautifulSoup(
+                        payload["data"].get("readme") or "", "html.parser"
+                    )
+                    for entry in notes.find_all("li"):
+                        note = entry.get_text(" ", strip=True)
+                        if re.match(
+                            r"GalGame\s*默认解压密码\s*[:：]", note, re.IGNORECASE
+                        ):
+                            if passwords := archive_passwords(note):
+                                resources = {
+                                    path: replace(item, archive_passwords=passwords)
+                                    if path.startswith("/GalGame/")
+                                    and not item.archive_passwords
+                                    else item
+                                    for path, item in resources.items()
+                                }
+                            break
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                self.logger.debug(
+                    "Gal Link could not read the CatCat archive note (%s)",
+                    type(exc).__name__,
+                )
         return group_volumes(
-            dict(item for item in resolved if item is not None),
+            resources,
             lambda folder: host + quote(folder or "/", safe="/"),
         )
 
@@ -539,6 +633,7 @@ class Sites:
                 for item in response.json()["data"]["attributes"]["downloads"] or []:
                     name = item["name"] or title
                     description = item.get("description") or ""
+                    passwords = archive_passwords(description)
                     kind = " / ".join(dict.fromkeys(item.get("platforms") or []))
                     links = share_links(description)
                     if links:
@@ -549,12 +644,15 @@ class Sites:
                                 link,
                                 kind,
                                 provider,
+                                archive_passwords=passwords,
                             )
                             for provider, link in links
                         )
                     elif item.get("path"):
                         link = f"{GAL_GAMES_API}/files/download?{urlencode({'path': item['path']})}"
-                        direct_files[item["path"]] = Resource(source, name, link, kind)
+                        direct_files[item["path"]] = Resource(
+                            source, name, link, kind, archive_passwords=passwords
+                        )
                 return [*group_volumes(direct_files), *found]
             response = await self.request("GET", url)
             soup = BeautifulSoup(response.text, "html.parser")
@@ -573,19 +671,40 @@ class Sites:
                 ]
                 kind = " / ".join(dict.fromkeys(filter(None, labels)))
                 content = entry.select_one(".content-text")
-                links = (
-                    share_links(content.get_text(" ", strip=True)) if content else []
-                )
+                description = content.get_text(" ", strip=True) if content else ""
+                passwords = archive_passwords(
+                    " ".join(
+                        tag.get_text(" ", strip=True)
+                        for tag in entry.select(".password-item")
+                    )
+                ) or archive_passwords(description)
+                links = share_links(description)
                 if content:
                     for link in content.select("a[href]"):
                         links.extend(share_links(link["href"]))
                 if links:
                     found.extend(
-                        Resource(source, name, link, kind, link_label=provider)
+                        Resource(
+                            source,
+                            name,
+                            link,
+                            kind,
+                            link_label=provider,
+                            archive_passwords=passwords,
+                        )
                         for provider, link in dict.fromkeys(links)
                     )
                 else:
-                    found.append(Resource(source, name, url, kind, link_label="资源页"))
+                    found.append(
+                        Resource(
+                            source,
+                            name,
+                            url,
+                            kind,
+                            link_label="资源页",
+                            archive_passwords=passwords,
+                        )
+                    )
             return found
 
         batches = await self.gather(
@@ -631,6 +750,9 @@ class Sites:
                             item["name"],
                             url,
                             link_label="资源页",
+                            archive_passwords=archive_passwords(
+                                item.get("description") or ""
+                            ),
                         )
                     )
         return found

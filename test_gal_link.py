@@ -949,7 +949,10 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                                 },
                                 {
                                     "name": "千恋万花 Ty",
-                                    "description": "Ty 版 https://pan.quark.cn/s/abc",
+                                    "description": (
+                                        "网盘提取码：ABCD，解压密码为 `Archive Code`。"
+                                        " https://pan.quark.cn/s/abc?pwd=ABCD"
+                                    ),
                                     "platforms": ["Ty"],
                                 },
                             ]
@@ -970,6 +973,115 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.link_label for item in results], ["下载", "夸克网盘"])
         self.assertEqual(results[0].type_label, "")
         self.assertEqual(results[1].type_label, "Ty")
+        rendered = plugin.GalLink.render(
+            plugin.ReplyState(0, title="千恋万花", resources=tuple(results))
+        )
+        self.assertIn("解压码  原站未注明", rendered)
+        self.assertIn(
+            "解压码  Archive Code\n夸克网盘  https://pan.quark.cn/s/abc?pwd=ABCD",
+            rendered,
+        )
+
+    async def test_inari_keeps_explicit_archive_passwords_scoped_to_their_resource(
+        self,
+    ):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+
+        async def transport(request):
+            if request.url.path == "/":
+                return httpx.Response(
+                    200, text='<a href="/detail/123"><h3>测试作品</h3></a>'
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <div class="resource-item" data-resource-id="1">
+                  <div class="resource-title-text"><h3>测试作品 PC</h3></div>
+                  <div class="content-text">提取码：SHAR</div>
+                  <div class="password-item"><span>解压密码：</span><span>春风@2</span></div>
+                  <button class="download-btn">下载</button>
+                </div>
+                <div class="resource-item" data-resource-id="2">
+                  <div class="resource-title-text"><h3>测试作品 APK</h3></div>
+                  <div class="password-item"><span>提取码：</span><span>ONLY</span></div>
+                  <button class="download-btn">下载</button>
+                </div>
+            """,
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)
+        ) as client:
+            results = await sources.Sites(client, "", plugin.logger).library(
+                sources.INARI,
+                "稻荷",
+                ("测试作品",),
+                {"测试作品"},
+            )
+        rendered = plugin.GalLink.render(
+            plugin.ReplyState(0, title="测试作品", resources=tuple(results))
+        )
+        self.assertIn("名称  测试作品 PC\n解压码  春风@2\n资源页", rendered)
+        self.assertIn("名称  测试作品 APK\n解压码  原站未注明\n资源页", rendered)
+        self.assertNotIn("ONLY", rendered)
+
+    async def test_catcat_uses_published_default_only_when_resource_has_no_code(self):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+        calls = []
+
+        async def transport(request):
+            body = json.loads(request.content)
+            if request.url.path == "/api/fs/search":
+                data = {
+                    "content": [
+                        {
+                            "parent": "/GalGame/甲",
+                            "name": "标题甲.zip",
+                            "is_dir": False,
+                        },
+                        {
+                            "parent": "/GalGame/乙",
+                            "name": "标题乙.zip",
+                            "is_dir": False,
+                        },
+                    ]
+                }
+            elif request.url.path == "/api/fs/get":
+                data = {
+                    "sign": "test",
+                    "readme": "解压口令：Local-42*"
+                    if "标题甲.zip" in body["path"]
+                    else "",
+                }
+            else:
+                self.assertEqual(request.url.path, "/api/fs/list")
+                self.assertEqual(body["path"], "/")
+                calls.append(body["path"])
+                data = {
+                    "readme": "<ul><li>GalGame 默认解压密码：<strong>Default-test</strong></li></ul>"
+                }
+            return httpx.Response(200, json={"code": 200, "data": data})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)
+        ) as client:
+            results = await sources.Sites(client, "", plugin.logger).openlist(
+                sources.CATCAT,
+                "喵盘",
+                "/GalGame",
+                ("标题",),
+                {"标题"},
+            )
+        rendered = plugin.GalLink.render(
+            plugin.ReplyState(0, title="标题", resources=tuple(results))
+        )
+        self.assertIn("名称  标题甲.zip\n解压码  Local-42*\n下载", rendered)
+        self.assertIn("名称  标题乙.zip\n解压码  Default-test\n下载", rendered)
+        self.assertEqual(calls, ["/"])
 
     async def test_partial_failure_keeps_other_hits(self):
         sources = importlib.import_module(
@@ -1041,7 +1153,15 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     for name in [*names, unrelated]
                 ]
             return httpx.Response(
-                200, json={"code": 200, "data": {"content": files, "total": len(files)}}
+                200,
+                json={
+                    "code": 200,
+                    "data": {
+                        "content": files,
+                        "total": len(files),
+                        "header": "## 🔑 解压码\n压缩密码：`Group-code`",
+                    },
+                },
             )
 
         async with httpx.AsyncClient(
@@ -1067,6 +1187,8 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("共 1 条资源", rendered)
         self.assertIn("标题.7z.010", rendered)
+        self.assertIn("解压码  Group-code\n标题.7z.001", rendered)
+        self.assertEqual(rendered.count("Group-code"), 1)
         self.assertNotIn("标题修正版", rendered)
         self.assertEqual(
             [endpoint for endpoint, _ in calls], ["/api/fs/search", "/api/fs/list"]
@@ -1118,7 +1240,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                 200,
                 text='<a href="https://example.org'
                 + request.url.path
-                + '">点击此处下载</a>',
+                + '">点击此处下载</a><p>解压码：<code>Site-code</code></p>',
             )
 
         async with httpx.AsyncClient(
@@ -1134,3 +1256,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             [f"{title}.part{i}.rar" for i in (1, 2, 3)],
         )
         self.assertTrue(all(not item.type_label for item in results))
+        rendered = plugin.GalLink.render(
+            plugin.ReplyState(0, title=title, resources=tuple(results))
+        )
+        self.assertIn("解压码  Site-code\n雨音Switch.part1.rar", rendered)

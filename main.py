@@ -615,10 +615,18 @@ class GalLink(Star):
                 lines.append(f"已找到 {len(item.volumes)} 个分卷")
                 if item.missing_volumes:
                     lines.append("分卷序号有缺失，请核对原站。")
-                lines.extend(
-                    f"{volume.title}  {volume.link_label}  {volume.url}"
-                    for volume in item.volumes
-                )
+            separate_passwords = not item.archive_passwords and any(
+                volume.archive_passwords for volume in item.volumes
+            )
+            if not separate_passwords:
+                passwords = " / ".join(item.archive_passwords) or "原站未注明"
+                lines.append(f"解压码  {passwords}")
+            if item.volumes:
+                for volume in item.volumes:
+                    if separate_passwords:
+                        passwords = " / ".join(volume.archive_passwords) or "原站未注明"
+                        lines.append(f"{volume.title} 解压码  {passwords}")
+                    lines.append(f"{volume.title}  {volume.link_label}  {volume.url}")
                 if item.link_label == "目录":
                     lines.append(f"目录  {item.url}")
             else:

@@ -5,6 +5,6 @@ support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.29.4,<5"
 desc: 在 QQ 群聊中搜索 Galgame 资源，支持平台多选、三语标题、纠错候选、分页，以及群白名单整点提醒和一键群发。
-version: v0.1.11
+version: v0.1.12
 author: maruyui-dev
 repo: https://github.com/maruyui-dev/astrbot_plugin_gal_link
