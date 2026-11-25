@@ -25,16 +25,18 @@ from .titles import (
     title_key,
 )
 
+LOOKUP_VERBS = r"查找|查询|搜索|检索|搜寻|寻找|找一找|查一查|搜一搜|找找|查查|搜搜"
 REQUEST = re.compile(
-    r"(?:请|麻烦)?(?:(?:能|可以|能不能|可不可以)?\s*帮我|给我|发我|我想|我要|想|求|有没有|能不能)?\s*"
-    r"(?:(?:查找|搜索|找找|找|搜|查|玩|下载)(?:\s*一下)?|一份|一个|下个游戏|下个)?\s*"
+    r"(?:请|麻烦)?\s*(?:(?:能|可以|能不能|可不可以)?\s*帮我|给我|发我|我想|我要|想|求|有没有|能不能)?\s*"
+    rf"(?:(?:{LOOKUP_VERBS}|找|搜|查|玩|下载)(?:\s*一下)?|一份|一个|下个游戏|下个)?\s*"
     r"(?P<title>[^，。！？?!；;\r\n]{2,100}?)"
     r"(?:\s*(?:的)?(?:游戏资源|安装包|游戏本体|下载链接|资源链接|下载地址|下载|资源))?"
     r"(?:\s*(?:吗|嘛|吧|谢谢|可以吗))?[。！？?!]?"
 )
 INTENT = re.compile(
-    r"^(?:请|麻烦)?(?:(?:能|可以|能不能|可不可以)?\s*帮我\s*(?:找|查|搜|下载)|我想\s*(?:玩|找|下载)|"
-    r"我要\s*(?:玩|找|下载)|想玩|找一下|找找|查找|查一下|搜一下|搜索|(?:求|给我|发我|有没有|能不能).*(?:资源|下载|安装包|游戏本体))"
+    rf"^(?:请|麻烦)?\s*(?:(?:能|可以|能不能|可不可以)?\s*帮我\s*(?:{LOOKUP_VERBS}|找|查|搜|下载)|"
+    rf"(?:我想|我要|想)\s*(?:{LOOKUP_VERBS}|玩|找|查|搜|下载)|{LOOKUP_VERBS}|[找查搜]\s*一下|"
+    r"(?:求|给我|发我|有没有|能不能).*(?:资源|下载|安装包|游戏本体))"
     r"|(?:安装包|游戏本体|下载链接|资源链接|游戏资源|下载地址)[。！？?!]?$"
 )
 NUMBER = re.compile(r"[0-9０-９]")
@@ -608,9 +610,19 @@ class GalLink(Star):
         for index, item in enumerate(state.resources[start:last], start + 1):
             lines.extend(["", f"{index}. {item.source}", f"名称  {item.title}"])
             if item.type_label:
-                origin = "（文件名标注）" if item.from_filename else ""
-                lines.append(f"类型  {item.type_label}{origin}")
-            lines.append(f"{item.link_label}  {item.url}")
+                lines.append(f"类型  {item.type_label}")
+            if item.volumes:
+                lines.append(f"已找到 {len(item.volumes)} 个分卷")
+                if item.missing_volumes:
+                    lines.append("分卷序号有缺失，请核对原站。")
+                lines.extend(
+                    f"{volume.title}  {volume.link_label}  {volume.url}"
+                    for volume in item.volumes
+                )
+                if item.link_label == "目录":
+                    lines.append(f"目录  {item.url}")
+            else:
+                lines.append(f"{item.link_label}  {item.url}")
         if last < total:
             lines.extend(
                 [

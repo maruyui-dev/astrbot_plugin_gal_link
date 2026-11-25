@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from itertools import zip_longest
 from urllib.parse import quote, urlencode, urljoin, urlsplit
@@ -26,7 +27,16 @@ TYPE_LABEL = re.compile(
     r"安卓(?:直装)?|安装直装|免安装(?:版)?|直装(?:版)?|安装版|硬盘版|便携版)(?![A-Za-z])",
     re.IGNORECASE,
 )
-ARCHIVE = re.compile(r"\.(?:7z|rar|zip|apk|ipa|iso|tar|gz|xz|exe)(?:\.\d+)?$", re.I)
+ARCHIVE = re.compile(
+    r"\.(?:(?:7z|rar|zip|apk|ipa|iso|tar|gz|xz|exe)(?:\.[0-9]{1,5})?|[rz][0-9]{2})$",
+    re.I,
+)
+VOLUME_SUFFIXES = (
+    (re.compile(r"(?i)(.+?)[ ._-]part([0-9]{1,5})(\.(?:rar|zip|7z))"), "part"),
+    (re.compile(r"(?i)(.+?)(\.(?:rar|zip|7z))\.([0-9]{3,5})"), "split"),
+    (re.compile(r"(?i)(.+)\.([rz])([0-9]{2})"), "legacy"),
+    (re.compile(r"(?i)(.*?[^0-9])([0-9]{2,3})(\.(?:rar|zip|7z))"), "suffix"),
+)
 PLATFORM_PATTERNS = tuple(
     re.compile(pattern, re.I)
     for pattern in (
@@ -59,8 +69,94 @@ class Resource:
     title: str
     url: str
     type_label: str = ""
-    from_filename: bool = False
     link_label: str = "下载"
+    volumes: tuple["Resource", ...] = ()
+    missing_volumes: bool = False
+
+
+def volume_info(name: str) -> tuple[str, str, int] | None:
+    """Identify a volume's archive name, naming scheme, and sequence number.
+
+    Args:
+        name: The filename supplied by the file listing.
+
+    Returns:
+        Part information, or None for an ordinary filename.
+    """
+    for pattern, scheme in VOLUME_SUFFIXES:
+        if match := pattern.fullmatch(name):
+            stem, second, third = match.groups()
+            if scheme == "split":
+                return stem + second, scheme, int(third)
+            if scheme == "legacy":
+                if second.lower() == "r":
+                    return stem + ".rar", scheme, int(third) + 2
+                return stem + ".zip", scheme, int(third)
+            if scheme == "suffix":
+                scheme += str(len(second))
+            return stem + third, scheme, int(second)
+    return None
+
+
+def group_volumes(
+    files: dict[str, Resource], directory_url: Callable[[str], str] | None = None
+) -> list[Resource]:
+    """Combine resolved links for each archive in a single directory.
+
+    Args:
+        files: Resources indexed by their site-specific file paths.
+        directory_url: Optional builder for the corresponding public directory link.
+
+    Returns:
+        Standalone resources and grouped volumes in first-seen order.
+    """
+    groups: dict[tuple[str, str, str], list[tuple[int, str, Resource]]] = {}
+    ordinary = {}
+    for path, item in files.items():
+        folder = path.rpartition("/")[0]
+        info = volume_info(item.title)
+        if info is None:
+            ordinary[(folder, item.title.casefold())] = (path, item)
+            continue
+        name, scheme, index = info
+        groups.setdefault((folder, name.casefold(), scheme), []).append(
+            (index, path, item)
+        )
+
+    replacements = {}
+    consumed = set()
+    for (folder, name, scheme), parts in groups.items():
+        if scheme.startswith("suffix") and len(parts) < 2:
+            continue
+        first_path = parts[0][1]
+        companion = ordinary.get((folder, name)) if scheme == "legacy" else None
+        indices = {index for index, _, _ in parts}
+        if companion and name.endswith(".rar"):
+            parts.append((1, *companion))
+            indices.add(1)
+        parts.sort(key=lambda part: part[0])
+        if companion and name.endswith(".zip"):
+            parts.append((0, *companion))
+        volumes = tuple(part for _, _, part in parts)
+        first = volumes[0]
+        kinds = {part.type_label for part in volumes if part.type_label}
+        replacements[first_path] = Resource(
+            first.source,
+            volume_info(files[first_path].title)[0],
+            directory_url(folder) if directory_url else first.url,
+            next(iter(kinds)) if len(kinds) == 1 else "",
+            "目录" if directory_url else first.link_label,
+            volumes,
+            min(indices) != 1
+            or max(indices) != len(indices)
+            or (scheme == "legacy" and companion is None),
+        )
+        consumed.update(path for _, path, _ in parts if path != first_path)
+    return [
+        replacements.get(path, item)
+        for path, item in files.items()
+        if path not in consumed
+    ]
 
 
 def type_label(text: str) -> str:
@@ -218,10 +314,60 @@ class Sites:
                 # Several resources on the same page can have different labels.
                 key = (
                     result.url,
-                    result.title if result.link_label == "资源页" else "",
+                    result.title
+                    if result.volumes or result.link_label == "资源页"
+                    else "",
                 )
                 found.setdefault(key, result)
         return list(found.values()), failed
+
+    async def expand_volumes(
+        self,
+        files: dict[str, str],
+        list_folder: Callable[[str], Awaitable[dict[str, str]]],
+    ) -> dict[str, str]:
+        """Include every known matching sibling for each selected search hit.
+
+        Args:
+            files: Matching paths and displayed filenames from the search.
+            list_folder: Reader for the site's public directory listing.
+
+        Returns:
+            Selected search hits and matching sibling paths.
+        """
+        selected = dict(list(files.items())[:20])
+        wanted: dict[str, set[tuple[str, str]]] = {}
+        for path, name in selected.items():
+            if info := volume_info(name):
+                wanted.setdefault(path.rpartition("/")[0], set()).add(
+                    (info[0].casefold(), info[1])
+                )
+        if not wanted:
+            return selected
+
+        listings = await asyncio.gather(
+            *(list_folder(folder) for folder in wanted), return_exceptions=True
+        )
+        available = dict(files)
+        for listing in listings:
+            if isinstance(listing, (httpx.HTTPError, ValueError, KeyError, TypeError)):
+                self.logger.warning(
+                    "Gal Link could not list a volume directory (%s)",
+                    type(listing).__name__,
+                )
+            elif isinstance(listing, BaseException):
+                raise listing
+            else:
+                available.update(listing)
+        for path, name in available.items():
+            keys = wanted.get(path.rpartition("/")[0])
+            if keys is None:
+                continue
+            info = volume_info(name)
+            key = (info[0].casefold(), info[1]) if info else (name.casefold(), "legacy")
+            if key in keys:
+                selected.setdefault(path, name)
+        return selected
 
     async def shinnku(self, terms, keys):
         pages = await self.gather(
@@ -237,7 +383,17 @@ class Sites:
                 if ARCHIVE.search(title) and any(
                     key in title_key(title) for key in keys
                 ):
-                    files.setdefault(item["href"], title)
+                    files.setdefault(urlsplit(item["href"]).path, title)
+
+        async def list_folder(folder):
+            page = await self.request("GET", SHINNKU + folder)
+            return {
+                path: item.get_text(" ", strip=True)
+                for item in BeautifulSoup(page.text, "html.parser").select(
+                    'a[href^="/files/"]'
+                )
+                if (path := urlsplit(item["href"]).path).rpartition("/")[0] == folder
+            }
 
         async def resolve(path, title):
             url = SHINNKU + path
@@ -250,13 +406,17 @@ class Sites:
                         provider = SHARE_HOSTS.get(
                             urlsplit(target).netloc.lower(), "下载"
                         )
-                        return Resource(
-                            "真红小站", title, target, type_label(title), True, provider
+                        return path, Resource(
+                            "真红小站", title, target, link_label=provider
                         )
-            return Resource("真红小站", title, url, type_label(title), True, "资源页")
+            return path, Resource("真红小站", title, url, link_label="资源页")
 
-        return await self.gather(
-            resolve(path, title) for path, title in list(files.items())[:20]
+        files = await self.expand_volumes(files, list_folder)
+        return group_volumes(
+            dict(
+                await self.gather(resolve(path, title) for path, title in files.items())
+            ),
+            lambda folder: SHINNKU + folder,
         )
 
     async def openlist(self, host, source, parent, terms, keys):
@@ -288,27 +448,58 @@ class Sites:
                 ):
                     paths.setdefault(item["parent"].rstrip("/") + "/" + name, name)
 
+        listed_signs = {}
+
+        async def list_folder(folder):
+            files = {}
+            page = 1
+            while True:
+                response = await self.request(
+                    "POST",
+                    f"{host}/api/fs/list",
+                    json={"path": folder or "/", "page": page, "per_page": 100},
+                )
+                payload = response.json()
+                if payload["code"] != 200:
+                    raise ValueError("Directory listing not available")
+                data = payload["data"]
+                entries = data["content"] or []
+                for entry in entries:
+                    name = entry["name"]
+                    if not entry["is_dir"] and "/" not in name:
+                        path = f"{folder}/{name}"
+                        files[path] = name
+                        if "sign" in entry:
+                            listed_signs[path] = entry["sign"]
+                if not entries or page * 100 >= data["total"]:
+                    return files
+                page += 1
+
         async def resolve(path, name):
-            response = await self.request(
-                "POST", f"{host}/api/fs/get", json={"path": path}
-            )
-            payload = response.json()
-            if payload["code"] != 200:
-                return None
-            sign = payload["data"].get("sign")
+            if path in listed_signs:
+                sign = listed_signs[path]
+            else:
+                response = await self.request(
+                    "POST", f"{host}/api/fs/get", json={"path": path}
+                )
+                payload = response.json()
+                if payload["code"] != 200:
+                    return None
+                sign = payload["data"].get("sign")
             # Use OpenList's public download route with the signature it supplied.
             url = f"{host}/d{quote(path, safe='/')}"
             if sign:
                 url += f"?sign={quote(sign, safe='')}"
-            return Resource(source, name, url, type_label(name), True)
+            return path, Resource(source, name, url)
 
-        return [
-            item
-            for item in await self.gather(
-                resolve(path, name) for path, name in list(paths.items())[:20]
-            )
-            if item is not None
-        ]
+        paths = await self.expand_volumes(paths, list_folder)
+        resolved = await self.gather(
+            resolve(path, name) for path, name in paths.items()
+        )
+        return group_volumes(
+            dict(item for item in resolved if item is not None),
+            lambda folder: host + quote(folder or "/", safe="/"),
+        )
 
     async def library(self, host, source, terms, keys):
         inari = host == INARI
@@ -344,15 +535,11 @@ class Sites:
                     "GET", GAL_GAMES_API + url.removeprefix(GAL_GAMES)
                 )
                 found = []
+                direct_files = {}
                 for item in response.json()["data"]["attributes"]["downloads"] or []:
                     name = item["name"] or title
                     description = item.get("description") or ""
-                    kind = type_label(description) or " / ".join(
-                        item.get("platforms") or []
-                    )
-                    filename_kind = (
-                        type_label(name) if not kind and ARCHIVE.search(name) else ""
-                    )
+                    kind = " / ".join(dict.fromkeys(item.get("platforms") or []))
                     links = share_links(description)
                     if links:
                         found.extend(
@@ -360,24 +547,15 @@ class Sites:
                                 source,
                                 name,
                                 link,
-                                kind or filename_kind,
-                                bool(filename_kind),
+                                kind,
                                 provider,
                             )
                             for provider, link in links
                         )
                     elif item.get("path"):
                         link = f"{GAL_GAMES_API}/files/download?{urlencode({'path': item['path']})}"
-                        found.append(
-                            Resource(
-                                source,
-                                name,
-                                link,
-                                kind or filename_kind,
-                                bool(filename_kind),
-                            )
-                        )
-                return found
+                        direct_files[item["path"]] = Resource(source, name, link, kind)
+                return [*group_volumes(direct_files), *found]
             response = await self.request("GET", url)
             soup = BeautifulSoup(response.text, "html.parser")
             found = []
@@ -393,9 +571,7 @@ class Sites:
                     type_label(tag.get_text(" ", strip=True))
                     for tag in entry.select(".resource-meta span[data-slot=base]")
                 ]
-                kind = " / ".join(dict.fromkeys(filter(None, labels))) or type_label(
-                    name
-                )
+                kind = " / ".join(dict.fromkeys(filter(None, labels)))
                 content = entry.select_one(".content-text")
                 links = (
                     share_links(content.get_text(" ", strip=True)) if content else []
@@ -454,7 +630,6 @@ class Sites:
                             "TouchGal",
                             item["name"],
                             url,
-                            type_label(item["name"]),
                             link_label="资源页",
                         )
                     )

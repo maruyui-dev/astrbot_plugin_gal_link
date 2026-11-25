@@ -249,42 +249,38 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://example.org/pc", result[-1])
         self.assertIn("https://example.org/unknown", result[-1])
 
-    async def test_ios_and_emulator_labels_are_detected_without_guessing_unmarked_types(
+    async def test_only_explicit_platform_labels_match_platform_filters(
         self,
     ):
-        sources = importlib.import_module(
-            "data.plugins.astrbot_plugin_gal_link.sources"
-        )
         star = plugin.GalLink(SimpleNamespace())
         self.addAsyncCleanup(star.terminate)
         work = plugin.Work("v1", "千恋万花", ("千恋万花",))
         star.titles.find = AsyncMock(return_value=[work])
-        filenames = [
-            "千恋万花.ipa",
-            "千恋万花_iOS.zip",
-            "千恋万花_Tyranor.zip",
-            "千恋万花_吉里吉里2.zip",
-            "千恋万花_ONScripter.zip",
-            "千恋万花_安卓.zip",
-            "千恋万花.zip",
+        files = [
+            ("千恋万花.ipa", ""),
+            ("千恋万花_iOS.zip", "iOS"),
+            ("千恋万花.zip", "Tyranor"),
+            ("千恋万花.zip", "吉里吉里2"),
+            ("千恋万花.zip", "ONScripter"),
+            ("千恋万花_安卓.zip", "安卓"),
+            ("千恋万花_Tyranor.zip", ""),
         ]
         resources = [
             plugin.Resource(
                 "测试站",
                 name,
                 f"https://example.org/{i}",
-                sources.type_label(name),
-                True,
+                kind,
             )
-            for i, name in enumerate(filenames)
+            for i, (name, kind) in enumerate(files)
         ]
         self.stub_resources(star, resources)
-        for choice, expected in (("3", {0, 1}), ("4", {2}), ("5", {3}), ("6", {4})):
+        for choice, expected in (("3", {1}), ("4", {2}), ("5", {3}), ("6", {4})):
             with self.subTest(choice=choice):
                 await self.send(star, "查找千恋万花")
                 result = await self.send(star, choice, target=None)
-                self.assertIn("文件名标注", result[-1])
-                for index in range(len(filenames)):
+                self.assertIn("类型  ", result[-1])
+                for index in range(len(files)):
                     self.assertEqual(
                         f"https://example.org/{index}" in result[-1], index in expected
                     )
@@ -836,7 +832,15 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             return [], 0
 
         star.sites.search = AsyncMock(side_effect=search)
-        for text in ("查找一下千恋万花", "我想玩千元万花", "给我一个千元万华的安装包"):
+        for text in (
+            "查找一下千恋万花",
+            "查询千恋万花",
+            "帮我检索一下 千恋万花",
+            "找一找千恋万花",
+            "搜寻千恋万花",
+            "我想玩千元万花",
+            "给我一个千元万华的安装包",
+        ):
             with self.subTest(text=text):
                 star.sites.search.reset_mock()
                 context.llm_generate.reset_mock()
@@ -860,7 +864,11 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                     replies[-1].startswith("找到《千恋＊万花》"), replies[-1]
                 )
                 star.sites.search.assert_awaited_once()
-                if text.startswith("查找一下"):
+                if "千恋万花" in text:
+                    self.assertEqual(
+                        plugin.title_key(star.sites.search.await_args.args[0][0]),
+                        "千恋万花",
+                    )
                     context.llm_generate.assert_not_awaited()
 
     async def test_correction_candidates_are_validated_and_selection_searches_three_languages(
@@ -942,6 +950,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                                 {
                                     "name": "千恋万花 Ty",
                                     "description": "Ty 版 https://pan.quark.cn/s/abc",
+                                    "platforms": ["Ty"],
                                 },
                             ]
                         }
@@ -959,8 +968,7 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
                 {"千恋万花"},
             )
         self.assertEqual([item.link_label for item in results], ["下载", "夸克网盘"])
-        self.assertEqual(results[0].type_label, "PC直装")
-        self.assertTrue(results[0].from_filename)
+        self.assertEqual(results[0].type_label, "")
         self.assertEqual(results[1].type_label, "Ty")
 
     async def test_partial_failure_keeps_other_hits(self):
@@ -1009,5 +1017,120 @@ class GalLinkTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(failed, 1)
         self.assertEqual([item.source for item in results], ["喵喵盘"])
-        self.assertEqual(results[0].type_label, "PC直装")
-        self.assertTrue(results[0].from_filename)
+        self.assertEqual(results[0].type_label, "")
+
+    async def test_openlist_expands_only_matching_siblings_and_renders_one_result(self):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+        folder = "/GalGame/标题"
+        calls = []
+        names = ["标题.7z.010", "标题.7z.002", "标题.7z.001"]
+        unrelated = "标题修正版.7z.003"
+
+        async def transport(request):
+            body = json.loads(request.content)
+            calls.append((request.url.path, body))
+            if request.url.path == "/api/fs/search":
+                files = [{"parent": folder, "name": names[0], "is_dir": False}]
+            else:
+                self.assertEqual(request.url.path, "/api/fs/list")
+                self.assertEqual(body["path"], folder)
+                files = [
+                    {"name": name, "is_dir": False, "sign": "file-sign"}
+                    for name in [*names, unrelated]
+                ]
+            return httpx.Response(
+                200, json={"code": 200, "data": {"content": files, "total": len(files)}}
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)
+        ) as client:
+            results = await sources.Sites(client, "", plugin.logger).openlist(
+                sources.CATCAT,
+                "喵盘",
+                "/GalGame",
+                ("标题",),
+                {"标题"},
+            )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            [item.title for item in results[0].volumes],
+            ["标题.7z.001", "标题.7z.002", "标题.7z.010"],
+        )
+        self.assertTrue(
+            all(item.url.endswith("?sign=file-sign") for item in results[0].volumes)
+        )
+        rendered = plugin.GalLink.render(
+            plugin.ReplyState(0, title="标题", resources=tuple(results))
+        )
+        self.assertIn("共 1 条资源", rendered)
+        self.assertIn("标题.7z.010", rendered)
+        self.assertNotIn("标题修正版", rendered)
+        self.assertEqual(
+            [endpoint for endpoint, _ in calls], ["/api/fs/search", "/api/fs/list"]
+        )
+        calls.clear()
+        names[:] = ["标题01.zip", "标题03.zip", "标题02.zip"]
+        unrelated = "标题修正版02.zip"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)
+        ) as client:
+            results = await sources.Sites(client, "", plugin.logger).openlist(
+                sources.MMPAN, "喵喵盘", "/", ("标题",), {"标题"}
+            )
+        self.assertEqual(len(results), 1)
+        self.assertEqual([item.title for item in results[0].volumes], sorted(names))
+        self.assertEqual(
+            [endpoint for endpoint, _ in calls], ["/api/fs/search", "/api/fs/list"]
+        )
+
+    async def test_shinnku_expands_rar_set_and_does_not_label_switch_in_title(self):
+        sources = importlib.import_module(
+            "data.plugins.astrbot_plugin_gal_link.sources"
+        )
+        folder = "/files/catalog/archive"
+        title = "雨音Switch"
+
+        async def transport(request):
+            if request.url.path == "/search":
+                return httpx.Response(
+                    200,
+                    text=(
+                        f'<a href="{folder}/rain.part2.rar">{title}.part2.rar</a>'
+                        f'<a href="{folder}/rain.7z">{title}.7z</a>'
+                    ),
+                )
+            if request.url.path == folder:
+                return httpx.Response(
+                    200,
+                    text="".join(
+                        f'<a href="{directory}/rain.part{index}.rar">{title}.part{index}.rar</a>'
+                        for directory, index in [
+                            (folder, 3),
+                            (folder, 1),
+                            ("/files/other", 4),
+                        ]
+                    ),
+                )
+            return httpx.Response(
+                200,
+                text='<a href="https://example.org'
+                + request.url.path
+                + '">点击此处下载</a>',
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)
+        ) as client:
+            results = await sources.Sites(client, "", plugin.logger).shinnku(
+                (title,),
+                {plugin.title_key(title)},
+            )
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            [item.title for item in results[0].volumes],
+            [f"{title}.part{i}.rar" for i in (1, 2, 3)],
+        )
+        self.assertTrue(all(not item.type_label for item in results))
